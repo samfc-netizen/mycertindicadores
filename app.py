@@ -1,705 +1,1501 @@
-import os
+from __future__ import annotations
+
+import argparse
 import re
+import sys
+import tempfile
+import unicodedata
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
 import pandas as pd
-from glob import glob
-from html.parser import HTMLParser
-from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
-from openpyxl.worksheet.datavalidation import DataValidation
-from openpyxl.worksheet.table import Table, TableStyleInfo
-from openpyxl.utils import get_column_letter
+from lxml import html
 
-# ============================================================
-# CONFIGURACAO
-# ============================================================
 
-PASTA = r"C:\Users\Samuel\Desktop\CERTIF\CERTIFICADOS"
-ARQUIVO_SAIDA = "CONSOLIDADO_FINAL.xlsx"
-
-# Arquivos auxiliares de AVP devem ser salvos na mesma pasta com nomes como:
-# JAN 2026.xlsx, FEV 2026.xls, MAR 2026 - atualizado.xlsx etc.
-# Esses arquivos NAO entram como relatorio principal. Eles servem apenas para trazer
-# o Nome do AVP por Protocolo e preencher a coluna AGR no consolidado/dashboard.
-MESES_AVP = {
-    "JAN", "FEV", "MAR", "ABR", "MAI", "JUN",
-    "JUL", "AGO", "SET", "OUT", "NOV", "DEZ"
+CUSTO_CERTIFICADO = 29.25
+MESES = {
+    "JAN": 1,
+    "JANEIRO": 1,
+    "FEV": 2,
+    "FEVEREIRO": 2,
+    "MAR": 3,
+    "MARCO": 3,
+    "MARÇO": 3,
+    "ABR": 4,
+    "ABRIL": 4,
+    "MAI": 5,
+    "MAIO": 5,
+    "JUN": 6,
+    "JUNHO": 6,
+    "JUL": 7,
+    "JULHO": 7,
+    "AGO": 8,
+    "AGOSTO": 8,
+    "SET": 9,
+    "SETEMBRO": 9,
+    "OUT": 10,
+    "OUTUBRO": 10,
+    "NOV": 11,
+    "NOVEMBRO": 11,
+    "DEZ": 12,
+    "DEZEMBRO": 12,
+}
+PADRAO_MESES_ARQUIVO = (
+    "JAN|JANEIRO|FEV|FEVEREIRO|MAR|MAR[CÇ]O|ABR|ABRIL|MAI|MAIO|"
+    "JUN|JUNHO|JUL|JULHO|AGO|AGOSTO|SET|SETEMBRO|OUT|OUTUBRO|"
+    "NOV|NOVEMBRO|DEZ|DEZEMBRO"
+)
+NOMES_MESES = {
+    1: "Janeiro",
+    2: "Fevereiro",
+    3: "Marco",
+    4: "Abril",
+    5: "Maio",
+    6: "Junho",
+    7: "Julho",
+    8: "Agosto",
+    9: "Setembro",
+    10: "Outubro",
+    11: "Novembro",
+    12: "Dezembro",
 }
 
 
-# ============================================================
-# LEITOR HTML SEM DEPENDER DE LXML/BS4
-# ============================================================
-
-class TabelaHTMLParser(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.tabelas = []
-        self.tabela_atual = None
-        self.linha_atual = None
-        self.celula_atual = None
-        self.dentro_td = False
-
-    def handle_starttag(self, tag, attrs):
-        tag = tag.lower()
-
-        if tag == "table":
-            self.tabela_atual = []
-
-        elif tag == "tr" and self.tabela_atual is not None:
-            self.linha_atual = []
-
-        elif tag in ("td", "th") and self.linha_atual is not None:
-            self.celula_atual = []
-            self.dentro_td = True
-
-        elif tag == "br" and self.dentro_td and self.celula_atual is not None:
-            self.celula_atual.append("\n")
-
-    def handle_endtag(self, tag):
-        tag = tag.lower()
-
-        if tag in ("td", "th") and self.dentro_td:
-            texto = "".join(self.celula_atual).strip()
-            texto = re.sub(r"[ \t]+", " ", texto)
-            self.linha_atual.append(texto)
-            self.celula_atual = None
-            self.dentro_td = False
-
-        elif tag == "tr" and self.linha_atual is not None:
-            if any(str(x).strip() for x in self.linha_atual):
-                self.tabela_atual.append(self.linha_atual)
-            self.linha_atual = None
-
-        elif tag == "table" and self.tabela_atual is not None:
-            self.tabelas.append(self.tabela_atual)
-            self.tabela_atual = None
-
-    def handle_data(self, data):
-        if self.dentro_td and self.celula_atual is not None:
-            self.celula_atual.append(data)
+@dataclass(frozen=True)
+class ArquivoMensal:
+    caminho: Path
+    mes: int
+    ano: int
+    mes_nome: str
 
 
-def ler_html_manual(caminho):
-    with open(caminho, "r", encoding="utf-8-sig", errors="ignore") as f:
-        html = f.read()
-
-    parser = TabelaHTMLParser()
-    parser.feed(html)
-
-    if not parser.tabelas:
-        raise Exception("Nenhuma tabela HTML encontrada.")
-
-    tabela = max(parser.tabelas, key=len)
-
-    cabecalho = tabela[0]
-    linhas = tabela[1:]
-
-    max_cols = max(len(cabecalho), max(len(l) for l in linhas))
-    cabecalho = cabecalho + [f"Coluna_{i + 1}" for i in range(len(cabecalho), max_cols)]
-
-    linhas_ajustadas = []
-    for linha in linhas:
-        linha = linha + [""] * (max_cols - len(linha))
-        linhas_ajustadas.append(linha[:max_cols])
-
-    return pd.DataFrame(linhas_ajustadas, columns=cabecalho[:max_cols])
-
-
-def ler_arquivo(caminho):
-    ext = os.path.splitext(caminho)[1].lower()
-
-    # 1) XLSX real
-    if ext == ".xlsx":
-        try:
-            return pd.read_excel(caminho, engine="openpyxl")
-        except Exception:
-            pass
-
-    # 2) XLS antigo real
-    if ext == ".xls":
-        try:
-            return pd.read_excel(caminho, engine="xlrd")
-        except Exception:
-            pass
-
-    # 3) HTML disfarcado de XLS via pandas
-    try:
-        tabelas = pd.read_html(caminho, encoding="utf-8")
-        if tabelas:
-            df = tabelas[0]
-
-            primeira_linha = [str(x).strip().lower() for x in df.iloc[0].tolist()]
-            if "data" in primeira_linha and "nome" in primeira_linha:
-                df.columns = df.iloc[0]
-                df = df.iloc[1:].reset_index(drop=True)
-
-            return df
-    except Exception:
-        pass
-
-    # 4) HTML disfarcado de XLS via parser interno
-    try:
-        return ler_html_manual(caminho)
-    except Exception as e:
-        raise Exception(f"Nao foi possivel identificar/ler o formato do arquivo. Detalhe: {e}")
-
-
-# ============================================================
-# EXTRACOES
-# ============================================================
-
-def extrair_nome_cpf_parceiro(valor):
+def normalizar_texto(valor: object) -> str:
     texto = "" if pd.isna(valor) else str(valor)
-    texto = texto.replace("\r", "\n")
-    texto = re.sub(r"\s+", " ", texto).strip()
-
-    nome = texto
-    cpf_cnpj = ""
-    parceiro = ""
-
-    m_cpf = re.search(r"CPF\s*/?\s*CNPJ\s*:\s*(.*?)(?:Parceiro\s*:|$)", texto, flags=re.I)
-    if m_cpf:
-        cpf_cnpj = m_cpf.group(1).strip()
-        nome = texto[:m_cpf.start()].strip()
-
-    m_parceiro = re.search(r"Parceiro\s*:\s*(.*)$", texto, flags=re.I)
-    if m_parceiro:
-        parceiro = m_parceiro.group(1).strip()
-
-    return pd.Series([nome, cpf_cnpj, parceiro])
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(ch for ch in texto if not unicodedata.combining(ch))
+    texto = re.sub(r"\s+", " ", texto).strip().upper()
+    return texto
 
 
-def extrair_pedido_emissor(valor):
-    texto = "" if pd.isna(valor) else str(valor)
-    texto = texto.replace("\r", "\n")
-    texto = re.sub(r"\s+", " ", texto).strip()
-
-    pedido = ""
-    emissor = ""
-
-    m = re.match(r"^(\d+)\s*(.*)$", texto)
-    if m:
-        pedido = m.group(1).strip()
-        emissor = m.group(2).strip()
-    else:
-        partes = texto.split(" ", 1)
-        pedido = partes[0].strip() if len(partes) > 0 else ""
-        emissor = partes[1].strip() if len(partes) > 1 else ""
-
-    return pd.Series([pedido, emissor])
-
-
-def localizar_coluna(df, nome_procurado, posicao_fallback):
-    for col in df.columns:
-        if str(col).strip().lower() == nome_procurado.lower():
-            return col
-
-    if df.shape[1] > posicao_fallback:
-        return df.columns[posicao_fallback]
-
-    raise Exception(
-        f"Nao encontrei a coluna {nome_procurado} e o arquivo nao possui a posicao esperada."
-    )
-
-
-def normalizar_texto_coluna(valor):
-    texto = "" if pd.isna(valor) else str(valor)
-    texto = texto.strip().lower()
-    texto = re.sub(r"[áàãâä]", "a", texto)
-    texto = re.sub(r"[éèêë]", "e", texto)
-    texto = re.sub(r"[íìîï]", "i", texto)
-    texto = re.sub(r"[óòõôö]", "o", texto)
-    texto = re.sub(r"[úùûü]", "u", texto)
-    texto = re.sub(r"ç", "c", texto)
-    texto = re.sub(r"[^a-z0-9]+", " ", texto)
-    return re.sub(r"\s+", " ", texto).strip()
-
-
-def localizar_coluna_flexivel(df, nomes_possiveis, obrigatoria=True):
-    mapa = {normalizar_texto_coluna(col): col for col in df.columns}
-
-    for nome in nomes_possiveis:
-        chave = normalizar_texto_coluna(nome)
-        if chave in mapa:
-            return mapa[chave]
-
-    # busca parcial para variações como "Nº Protocolo", "Nome AVP", etc.
-    for chave, col in mapa.items():
-        for nome in nomes_possiveis:
-            nome_norm = normalizar_texto_coluna(nome)
-            if nome_norm and nome_norm in chave:
-                return col
-
-    if obrigatoria:
-        raise Exception(f"Nao encontrei nenhuma destas colunas: {', '.join(nomes_possiveis)}")
-    return None
-
-
-def normalizar_protocolo(valor):
-    if pd.isna(valor):
-        return ""
-    texto = str(valor).strip()
-    if texto.endswith(".0"):
-        texto = texto[:-2]
-    texto = re.sub(r"\s+", "", texto)
-    return texto.upper()
-
-
-def nome_arquivo_eh_base_avp(nome_arquivo):
-    nome_sem_ext = os.path.splitext(os.path.basename(nome_arquivo))[0].upper().strip()
-    partes = re.split(r"[\s_\-]+", nome_sem_ext)
-    if len(partes) < 2:
-        return False
-
-    mes = partes[0]
-    ano_encontrado = any(re.fullmatch(r"20\d{2}", parte) for parte in partes[1:])
-    return mes in MESES_AVP and ano_encontrado
-
-
-def carregar_base_avp(arquivos_avp):
-    lista = []
-
-    for arquivo in arquivos_avp:
-        nome_arquivo = os.path.basename(arquivo)
-        print(f"Lendo base AVP: {nome_arquivo}")
-
-        try:
-            df_avp = ler_arquivo(arquivo)
-            df_avp = df_avp.dropna(how="all").reset_index(drop=True)
-
-            if df_avp.empty:
-                print(f"Base AVP vazia ignorada: {nome_arquivo}")
-                continue
-
-            col_protocolo = localizar_coluna_flexivel(
-                df_avp,
-                ["Protocolo", "N Protocolo", "Numero Protocolo", "Nº Protocolo", "Num Protocolo"],
-            )
-            col_avp = localizar_coluna_flexivel(
-                df_avp,
-                ["Nome do AVP", "Nome AVP", "AVP", "AGR", "Nome do AGR", "Nome AGR"],
-            )
-
-            temp = df_avp[[col_protocolo, col_avp]].copy()
-            temp.columns = ["Protocolo_Normalizado", "Nome do AVP"]
-            temp["Protocolo_Normalizado"] = temp["Protocolo_Normalizado"].apply(normalizar_protocolo)
-            temp["Nome do AVP"] = temp["Nome do AVP"].fillna("").astype(str).str.strip()
-            temp["Arquivo_AVP"] = nome_arquivo
-            temp = temp[temp["Protocolo_Normalizado"].astype(str).str.len() > 0]
-            temp = temp[temp["Nome do AVP"].astype(str).str.len() > 0]
-
-            lista.append(temp)
-            print(f"OK -> base AVP {nome_arquivo} | Protocolos: {len(temp)}")
-
-        except Exception as e:
-            print(f"ERRO -> base AVP {nome_arquivo}: {e}")
-
-    if not lista:
-        return pd.DataFrame(columns=["Protocolo_Normalizado", "Nome do AVP", "Arquivo_AVP"])
-
-    base_avp = pd.concat(lista, ignore_index=True)
-    base_avp = base_avp.drop_duplicates(subset=["Protocolo_Normalizado"], keep="last")
-    return base_avp
-
-
-def aplicar_avp_no_consolidado(df, base_avp):
-    df = df.copy()
-
-    col_protocolo = localizar_coluna_flexivel(
-        df,
-        ["Protocolo", "N Protocolo", "Numero Protocolo", "Nº Protocolo", "Num Protocolo"],
-        obrigatoria=False,
-    )
-
-    if col_protocolo is None:
-        print("AVISO: Nao encontrei coluna Protocolo no consolidado. AGR/AVP nao foi aplicado.")
-        df["Protocolo_Normalizado"] = ""
-        df["Nome do AVP"] = ""
-        df["AGR"] = ""
-        return df
-
-    df["Protocolo_Normalizado"] = df[col_protocolo].apply(normalizar_protocolo)
-
-    if base_avp.empty:
-        print("AVISO: Nenhuma base AVP foi carregada. AGR ficara vazio quando nao houver AGR antigo.")
-        if "Nome do AVP" not in df.columns:
-            df["Nome do AVP"] = ""
-        if "AGR" not in df.columns:
-            df["AGR"] = df["Nome do AVP"]
-        return df
-
-    df = df.merge(base_avp, on="Protocolo_Normalizado", how="left")
-
-    # Se ja existir uma coluna AGR antiga, ela fica preservada em AGR_Original.
-    if "AGR" in df.columns:
-        df["AGR_Original"] = df["AGR"]
-
-    df["Nome do AVP"] = df["Nome do AVP"].fillna("").astype(str).str.strip()
-    df["AGR"] = df["Nome do AVP"]
-
-    protocolos_com_avp = (df["Nome do AVP"].astype(str).str.len() > 0).sum()
-    print(f"AVP aplicado no consolidado. Linhas com AVP encontrado: {protocolos_com_avp}")
-
-    return df
-
-
-def coluna_excel(df, nome_coluna):
-    if nome_coluna not in df.columns:
-        return None
-    return get_column_letter(list(df.columns).index(nome_coluna) + 1)
-
-
-def normalizar_documento(valor):
-    return re.sub(r"\D", "", "" if pd.isna(valor) else str(valor))
-
-
-def identificar_tipo_documento(valor):
-    doc = normalizar_documento(valor)
-    if len(doc) == 11:
-        return "CPF"
-    if len(doc) == 14:
-        return "CNPJ"
-    return "NAO IDENTIFICADO"
-
-
-def converter_valor(valor):
+def moeda_para_float(valor: object) -> float:
     if pd.isna(valor):
         return 0.0
     if isinstance(valor, (int, float)):
         return float(valor)
-
-    texto = str(valor)
-    texto = texto.replace("R$", "").replace(" ", "").strip()
-    texto = texto.replace(".", "").replace(",", ".")
-    texto = re.sub(r"[^0-9.\-]", "", texto)
-
+    texto = str(valor).strip()
+    texto = texto.replace("R$", "").replace("\xa0", " ")
+    texto = re.sub(r"[^0-9,.-]", "", texto)
+    if not texto:
+        return 0.0
+    if "," in texto:
+        texto = texto.replace(".", "").replace(",", ".")
     try:
         return float(texto)
-    except Exception:
+    except ValueError:
         return 0.0
 
 
-def preparar_campos_indicadores(df):
-    df = df.copy()
-    df["Data_Tratada"] = pd.to_datetime(df.get("Data"), dayfirst=True, errors="coerce")
-    df["Periodo"] = df["Data_Tratada"].dt.strftime("%m/%Y")
-    df["Ano"] = df["Data_Tratada"].dt.year
-    df["Documento_Normalizado"] = df.get("CPF_CNPJ", "").apply(normalizar_documento)
-    df["Tipo_Documento"] = df.get("CPF_CNPJ", "").apply(identificar_tipo_documento)
-    df["Valor_Numerico"] = df.get("Valor", "").apply(converter_valor)
+def formatar_moeda(valor: float) -> str:
+    texto = f"R$ {valor:,.2f}"
+    return texto.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def formatar_percentual(valor: float) -> str:
+    return f"{valor:.1f}%".replace(".", ",")
+
+
+def preparar_datas_para_tela(df: pd.DataFrame) -> pd.DataFrame:
+    saida = df.copy()
+    for col in saida.columns:
+        if "data" in str(col).lower():
+            saida[col] = pd.to_datetime(saida[col], errors="coerce").dt.date
+    return saida
+
+
+def mostrar_tabela(st, df: pd.DataFrame, **kwargs):
+    df_tela = preparar_datas_para_tela(df)
+    date_cols = [col for col in df_tela.columns if "data" in str(col).lower()]
+    column_config = kwargs.pop("column_config", {})
+    for col in date_cols:
+        column_config[col] = st.column_config.DateColumn(col, format="DD/MM/YYYY")
+    st.dataframe(df_tela, column_config=column_config, **kwargs)
+
+
+def arquivo_mes_ano(caminho: Path) -> ArquivoMensal | None:
+    nome = caminho.stem
+    match = re.search(
+        rf"\b({PADRAO_MESES_ARQUIVO})\b[\s_\-.]*(\d{{4}})\b",
+        nome,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    mes_nome = normalizar_texto(match.group(1))
+    ano = int(match.group(2))
+    mes = MESES.get(mes_nome)
+    if not mes:
+        return None
+    return ArquivoMensal(caminho=caminho, mes=mes, ano=ano, mes_nome=mes_nome)
+
+
+def localizar_planilhas(pasta: Path) -> list[ArquivoMensal]:
+    extensoes = {".xls", ".xlsx", ".html", ".htm"}
+    arquivos: list[ArquivoMensal] = []
+    for caminho in pasta.iterdir():
+        if not caminho.is_file() or caminho.suffix.lower() not in extensoes:
+            continue
+        if normalizar_texto(caminho.stem).startswith("PARCEIROS"):
+            continue
+        info = arquivo_mes_ano(caminho)
+        if info and not eh_planilha_avp(caminho):
+            arquivos.append(info)
+    return sorted(arquivos, key=lambda item: (item.ano, item.mes, item.caminho.name))
+
+
+
+def normalizar_protocolo(valor: object) -> str:
+    texto = "" if pd.isna(valor) else str(valor)
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(ch for ch in texto if not unicodedata.combining(ch))
+    texto = texto.strip().upper()
+    texto = re.sub(r"\.0$", "", texto)
+    texto = re.sub(r"[^A-Z0-9]", "", texto)
+    return texto
+
+
+def localizar_coluna_flexivel(df: pd.DataFrame, alternativas: Iterable[str]) -> str | None:
+    mapa = {normalizar_texto(col): col for col in df.columns}
+    alternativas_norm = [normalizar_texto(nome) for nome in alternativas]
+
+    for nome in alternativas_norm:
+        if nome in mapa:
+            return mapa[nome]
+
+    for col_norm, col_original in mapa.items():
+        for nome in alternativas_norm:
+            if nome and nome in col_norm:
+                return col_original
+    return None
+
+
+def ler_tabela_generica(caminho: Path) -> pd.DataFrame:
+    ext = caminho.suffix.lower()
+    if ext == ".csv":
+        try:
+            return pd.read_csv(caminho, sep=None, engine="python")
+        except Exception:
+            return pd.read_csv(caminho)
+
+    texto_inicial = caminho.read_bytes()[:256].decode("utf-8", errors="ignore").lower()
+    if ext in {".html", ".htm"} or "<html" in texto_inicial or "<table" in texto_inicial:
+        tabelas = pd.read_html(caminho)
+        return tabelas[0] if tabelas else pd.DataFrame()
+
+    bruto = pd.read_excel(caminho, header=None)
+    if bruto.empty:
+        return pd.DataFrame()
+
+    for idx, row in bruto.iterrows():
+        valores = [normalizar_texto(v) for v in row.tolist()]
+        tem_protocolo = any("PROTOCOLO" == v or "PROTOCOLO" in v for v in valores)
+        tem_avp = any(v in {"NOME DO AVP", "NOME AVP", "AVP"} or "AVP" in v for v in valores)
+        if tem_protocolo and tem_avp:
+            df = pd.read_excel(caminho, header=idx)
+            df = df.dropna(how="all")
+            df.columns = [str(c).strip() for c in df.columns]
+            return df
+
+    df = pd.read_excel(caminho)
+    df = df.dropna(how="all")
+    df.columns = [str(c).strip() for c in df.columns]
     return df
 
 
-def criar_lista_renovacao(df):
-    base = df[
-        (df["Ano"] == 2025)
-        & (df["Documento_Normalizado"].astype(str).str.len() > 0)
+def eh_planilha_avp(caminho: Path) -> bool:
+    if normalizar_texto(caminho.stem).startswith("PARCEIROS"):
+        return False
+    try:
+        df = ler_tabela_generica(caminho)
+    except Exception:
+        return False
+    if df.empty:
+        return False
+    col_protocolo = localizar_coluna_flexivel(df, ["Protocolo"])
+    col_avp = localizar_coluna_flexivel(df, ["Nome do AVP", "Nome AVP", "AVP"])
+    return col_protocolo is not None and col_avp is not None
+
+
+def localizar_planilhas_avp(pasta: Path) -> list[ArquivoMensal]:
+    extensoes = {".xls", ".xlsx", ".csv", ".html", ".htm"}
+    arquivos: list[ArquivoMensal] = []
+    for caminho in pasta.iterdir():
+        if not caminho.is_file() or caminho.suffix.lower() not in extensoes:
+            continue
+        info = arquivo_mes_ano(caminho)
+        if info and eh_planilha_avp(caminho):
+            arquivos.append(info)
+    return sorted(arquivos, key=lambda item: (item.ano, item.mes, item.caminho.name))
+
+
+def carregar_mapa_avp(pasta: Path) -> pd.DataFrame:
+    frames = []
+    for info in localizar_planilhas_avp(pasta):
+        try:
+            df = ler_tabela_generica(info.caminho)
+            col_protocolo = localizar_coluna_flexivel(df, ["Protocolo"])
+            col_avp = localizar_coluna_flexivel(df, ["Nome do AVP", "Nome AVP", "AVP"])
+            if col_protocolo is None or col_avp is None:
+                continue
+            base = df[[col_protocolo, col_avp]].copy()
+            base.columns = ["Protocolo", "Nome do AVP"]
+            base["Protocolo Normalizado"] = base["Protocolo"].map(normalizar_protocolo)
+            base["Nome do AVP"] = base["Nome do AVP"].fillna("").astype(str).str.strip()
+            base = base[(base["Protocolo Normalizado"] != "") & (base["Nome do AVP"] != "")].copy()
+            base["Ano Arquivo"] = info.ano
+            base["Mes Arquivo"] = info.mes
+            base["Arquivo AVP"] = info.caminho.name
+            frames.append(base)
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame(columns=["Ano Arquivo", "Mes Arquivo", "Protocolo Normalizado", "Nome do AVP", "Arquivo AVP"])
+    mapa = pd.concat(frames, ignore_index=True)
+    mapa = mapa.drop_duplicates(["Ano Arquivo", "Mes Arquivo", "Protocolo Normalizado"], keep="last")
+    return mapa[["Ano Arquivo", "Mes Arquivo", "Protocolo Normalizado", "Nome do AVP", "Arquivo AVP"]]
+
+
+def aplicar_avp_no_agr(dados: pd.DataFrame, pasta: Path) -> pd.DataFrame:
+    if dados.empty:
+        return dados
+    mapa_avp = carregar_mapa_avp(pasta)
+    dados = dados.copy()
+    if "Protocolo" not in dados.columns:
+        dados["Protocolo"] = dados.get("Pedido", "")
+    dados["Protocolo Normalizado"] = dados["Protocolo"].map(normalizar_protocolo)
+    dados["Nome do AVP"] = ""
+    dados["Arquivo AVP"] = ""
+    dados["AGR Original"] = dados.get("AGR", "")
+
+    if mapa_avp.empty:
+        return dados
+
+    dados = dados.merge(
+        mapa_avp,
+        how="left",
+        on=["Ano Arquivo", "Mes Arquivo", "Protocolo Normalizado"],
+        suffixes=("", "_MAPA_AVP"),
+    )
+    if "Nome do AVP_MAPA_AVP" in dados.columns:
+        dados["Nome do AVP"] = dados["Nome do AVP_MAPA_AVP"].fillna("").astype(str).str.strip()
+        dados = dados.drop(columns=["Nome do AVP_MAPA_AVP"])
+    else:
+        dados["Nome do AVP"] = dados["Nome do AVP"].fillna("").astype(str).str.strip()
+
+    if "Arquivo AVP_MAPA_AVP" in dados.columns:
+        dados["Arquivo AVP"] = dados["Arquivo AVP_MAPA_AVP"].fillna("").astype(str).str.strip()
+        dados = dados.drop(columns=["Arquivo AVP_MAPA_AVP"])
+    else:
+        dados["Arquivo AVP"] = dados["Arquivo AVP"].fillna("").astype(str).str.strip()
+
+    usar_avp = dados["Nome do AVP"].astype(str).str.strip() != ""
+    dados.loc[usar_avp, "AGR"] = dados.loc[usar_avp, "Nome do AVP"]
+    dados["AVP Encontrado"] = usar_avp
+    return dados
+
+
+def extrair_registros_html(caminho: Path) -> pd.DataFrame:
+    texto = caminho.read_text(encoding="utf-8-sig", errors="replace")
+    doc = html.fromstring(texto)
+    rows = doc.xpath("//table//tr")
+    registros: list[dict[str, object]] = []
+    for tr in rows[1:]:
+        tds = tr.xpath("./td")
+        if len(tds) < 8:
+            continue
+        nome_linhas = [x.strip() for x in tds[1].xpath(".//text()") if x.strip()]
+        pedido_linhas = [x.strip() for x in tds[3].xpath(".//text()") if x.strip()]
+        cpf_cnpj = ""
+        parceiro = ""
+        for linha in nome_linhas[1:]:
+            linha_limpa = linha.strip()
+            if linha_limpa.upper().startswith("CPF/CNPJ:"):
+                cpf_cnpj = linha_limpa.split(":", 1)[1].strip()
+            elif linha_limpa.upper().startswith("PARCEIRO:"):
+                parceiro = linha_limpa.split(":", 1)[1].strip()
+
+        registros.append(
+            {
+                "Data": tds[0].text_content().strip(),
+                "Nome": nome_linhas[0] if nome_linhas else "",
+                "CPF/CNPJ": cpf_cnpj,
+                "Parceiro": parceiro,
+                "Modelo": tds[2].text_content().strip(),
+                "Pedido": pedido_linhas[0] if pedido_linhas else "",
+                "Protocolo": pedido_linhas[0] if pedido_linhas else "",
+                "Certificadora": pedido_linhas[1] if len(pedido_linhas) > 1 else "",
+                "Valor Planilha": moeda_para_float(tds[4].text_content().strip()),
+                "Vendedor": tds[5].text_content().strip(),
+                "AGR": tds[6].text_content().strip(),
+                "Origem": tds[7].text_content().strip(),
+            }
+        )
+    return pd.DataFrame(registros)
+
+
+def extrair_registros_excel(caminho: Path) -> pd.DataFrame:
+    bruto = pd.read_excel(caminho, header=None)
+    if bruto.empty:
+        return pd.DataFrame()
+    linha_cabecalho = None
+    for idx, row in bruto.iterrows():
+        valores = [normalizar_texto(v) for v in row.tolist()]
+        if "DATA" in valores and "NOME" in valores and "VALOR" in valores:
+            linha_cabecalho = idx
+            break
+    if linha_cabecalho is None:
+        raise ValueError(f"Nao encontrei cabecalho na planilha {caminho.name}.")
+    df = pd.read_excel(caminho, header=linha_cabecalho)
+    df = df.dropna(how="all")
+    df.columns = [str(c).strip() for c in df.columns]
+    if "Valor" in df.columns:
+        df["Valor Planilha"] = df["Valor"].map(moeda_para_float)
+    elif "Valor Planilha" not in df.columns:
+        df["Valor Planilha"] = 0.0
+    col_protocolo = localizar_coluna_flexivel(df, ["Protocolo"])
+    if col_protocolo and col_protocolo != "Protocolo":
+        df["Protocolo"] = df[col_protocolo]
+    for col in ["Data", "Nome", "Modelo", "Pedido", "Protocolo", "Vendedor", "AGR", "Origem", "Parceiro", "CPF/CNPJ"]:
+        if col not in df.columns:
+            df[col] = ""
+    if df["Protocolo"].astype(str).str.strip().eq("").all():
+        df["Protocolo"] = df["Pedido"]
+    return df[
+        ["Data", "Nome", "CPF/CNPJ", "Parceiro", "Modelo", "Pedido", "Protocolo", "Valor Planilha", "Vendedor", "AGR", "Origem"]
     ].copy()
-    renovados_2026 = set(
-        df.loc[
-            (df["Ano"] == 2026)
-            & (df["Documento_Normalizado"].astype(str).str.len() > 0),
-            "Documento_Normalizado",
-        ].astype(str)
+
+
+def ler_arquivo_mensal(info: ArquivoMensal) -> pd.DataFrame:
+    texto_inicial = info.caminho.read_bytes()[:128].decode("utf-8", errors="ignore").lower()
+    if "<html" in texto_inicial or "<div" in texto_inicial or "<table" in texto_inicial:
+        df = extrair_registros_html(info.caminho)
+    else:
+        df = extrair_registros_excel(info.caminho)
+    if df.empty:
+        return df
+    df["Arquivo"] = info.caminho.name
+    df["Ano Arquivo"] = info.ano
+    df["Mes Arquivo"] = info.mes
+    return df
+
+
+def encontrar_planilha_parceiros(pasta: Path) -> Path | None:
+    candidatos = []
+    for caminho in pasta.iterdir():
+        if caminho.is_file() and caminho.suffix.lower() in {".xls", ".xlsx", ".csv"}:
+            if normalizar_texto(caminho.stem).startswith("PARCEIROS"):
+                candidatos.append(caminho)
+    return sorted(candidatos)[0] if candidatos else None
+
+
+def carregar_precos_parceiros(pasta: Path) -> pd.DataFrame:
+    caminho = encontrar_planilha_parceiros(pasta)
+    if caminho is None:
+        return pd.DataFrame(columns=["Parceiro", "Valor Parceiro", "Parceiro Normalizado"])
+    if caminho.suffix.lower() == ".csv":
+        df = pd.read_csv(caminho)
+    elif caminho.suffix.lower() == ".xls":
+        texto_inicial = caminho.read_bytes()[:128].decode("utf-8", errors="ignore").lower()
+        if "<table" in texto_inicial or "<html" in texto_inicial:
+            tabelas = pd.read_html(caminho)
+            df = tabelas[0] if tabelas else pd.DataFrame()
+        else:
+            df = pd.read_excel(caminho)
+    else:
+        df = pd.read_excel(caminho)
+
+    if df.empty or len(df.columns) < 2:
+        return pd.DataFrame(columns=["Parceiro", "Valor Parceiro", "Parceiro Normalizado"])
+    df = df.iloc[:, :2].copy()
+    df.columns = ["Parceiro", "Valor Parceiro"]
+    df = df.dropna(subset=["Parceiro"])
+    df["Valor Parceiro"] = df["Valor Parceiro"].map(moeda_para_float)
+    df["Parceiro Normalizado"] = df["Parceiro"].map(normalizar_texto)
+    return df
+
+
+def classificar_tipo(modelo: object, documento: object) -> str:
+    texto_modelo = normalizar_texto(modelo)
+    doc = re.sub(r"\D", "", "" if pd.isna(documento) else str(documento))
+    if "CNPJ" in texto_modelo or len(doc) == 14:
+        return "CNPJ"
+    if "CPF" in texto_modelo or len(doc) == 11:
+        return "CPF"
+    if "PJ" in texto_modelo:
+        return "CNPJ"
+    return "Nao identificado"
+
+
+def carregar_dados(pasta: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    arquivos = localizar_planilhas(pasta)
+    frames = [ler_arquivo_mensal(info) for info in arquivos]
+    dados = pd.concat([df for df in frames if not df.empty], ignore_index=True) if frames else pd.DataFrame()
+    precos = carregar_precos_parceiros(pasta)
+    if dados.empty:
+        return dados, precos
+
+    dados["Data"] = pd.to_datetime(dados["Data"], dayfirst=True, errors="coerce")
+    dados = dados.dropna(subset=["Data"]).copy()
+    dados["Ano"] = dados["Data"].dt.year
+    dados["Mes"] = dados["Data"].dt.month
+    dados["Mes Nome"] = dados["Mes"].map(NOMES_MESES)
+    dados["Documento Limpo"] = dados["CPF/CNPJ"].astype(str).str.replace(r"\D", "", regex=True)
+    dados["Parceiro"] = dados["Parceiro"].fillna("").replace("", "SEM INDICAÇÃO")
+    dados["Origem"] = dados["Origem"].fillna("").str.strip().replace("", "Interno")
+    dados["Origem Normalizada"] = dados["Origem"].map(normalizar_texto)
+    dados["Parceiro Normalizado"] = dados["Parceiro"].map(normalizar_texto)
+    dados["Valor Planilha"] = dados["Valor Planilha"].map(moeda_para_float)
+    dados["Tipo"] = [classificar_tipo(m, d) for m, d in zip(dados["Modelo"], dados["CPF/CNPJ"])]
+    dados = aplicar_avp_no_agr(dados, pasta)
+
+    mapa_precos = precos.drop_duplicates("Parceiro Normalizado").set_index("Parceiro Normalizado")[
+        "Valor Parceiro"
+    ].to_dict()
+    dados["Valor Parceiro"] = dados["Parceiro Normalizado"].map(mapa_precos)
+    eh_parceiro = dados["Origem Normalizada"].eq("PARCEIRO")
+    dados["Valor Considerado"] = dados["Valor Planilha"]
+    dados.loc[eh_parceiro & dados["Valor Parceiro"].notna(), "Valor Considerado"] = dados.loc[
+        eh_parceiro & dados["Valor Parceiro"].notna(), "Valor Parceiro"
+    ]
+    dados["Preco Parceiro Ausente"] = eh_parceiro & dados["Valor Parceiro"].isna()
+    dados["Custo"] = CUSTO_CERTIFICADO
+    dados["Margem Bruta"] = dados["Valor Considerado"] - dados["Custo"]
+    dados["Margem %"] = dados["Margem Bruta"].where(dados["Valor Considerado"] != 0, 0) / dados[
+        "Valor Considerado"
+    ].replace(0, pd.NA)
+    dados["Margem %"] = dados["Margem %"].fillna(0.0)
+    return dados, precos
+
+
+def aplicar_calculos_simulacao(dados: pd.DataFrame, precos: pd.DataFrame) -> pd.DataFrame:
+    if dados.empty:
+        return dados
+    dados = dados.copy()
+    dados["Data"] = pd.to_datetime(dados["Data"], dayfirst=True, errors="coerce")
+    dados = dados.dropna(subset=["Data"]).copy()
+    dados["Ano"] = dados["Data"].dt.year
+    dados["Mes"] = dados["Data"].dt.month
+    dados["Mes Nome"] = dados["Mes"].map(NOMES_MESES)
+    dados["Documento Limpo"] = dados["CPF/CNPJ"].astype(str).str.replace(r"\D", "", regex=True)
+    dados["Parceiro"] = dados["Parceiro"].fillna("").replace("", "SEM INDICAÇÃO")
+    dados["Origem"] = dados["Origem"].fillna("").str.strip().replace("", "Interno")
+    dados["Origem Normalizada"] = dados["Origem"].map(normalizar_texto)
+    dados["Parceiro Normalizado"] = dados["Parceiro"].map(normalizar_texto)
+    dados["Valor Planilha"] = dados["Valor Planilha"].map(moeda_para_float)
+    dados["Tipo"] = [classificar_tipo(m, d) for m, d in zip(dados["Modelo"], dados["CPF/CNPJ"])]
+    if "Protocolo" not in dados.columns:
+        dados["Protocolo"] = dados.get("Pedido", "")
+    dados["Protocolo Normalizado"] = dados["Protocolo"].map(normalizar_protocolo)
+    dados["Nome do AVP"] = ""
+    dados["AGR Original"] = dados.get("AGR", "")
+    dados["AVP Encontrado"] = False
+
+    if precos.empty:
+        mapa_precos = {}
+    else:
+        mapa_precos = precos.drop_duplicates("Parceiro Normalizado").set_index("Parceiro Normalizado")[
+            "Valor Parceiro"
+        ].to_dict()
+    dados["Valor Parceiro"] = dados["Parceiro Normalizado"].map(mapa_precos)
+    eh_parceiro = dados["Origem Normalizada"].eq("PARCEIRO")
+    dados["Valor Considerado"] = dados["Valor Planilha"]
+    dados.loc[eh_parceiro & dados["Valor Parceiro"].notna(), "Valor Considerado"] = dados.loc[
+        eh_parceiro & dados["Valor Parceiro"].notna(), "Valor Parceiro"
+    ]
+    dados["Preco Parceiro Ausente"] = eh_parceiro & dados["Valor Parceiro"].isna()
+    dados["Custo"] = CUSTO_CERTIFICADO
+    dados["Margem Bruta"] = dados["Valor Considerado"] - dados["Custo"]
+    dados["Margem %"] = dados["Margem Bruta"].where(dados["Valor Considerado"] != 0, 0) / dados[
+        "Valor Considerado"
+    ].replace(0, pd.NA)
+    dados["Margem %"] = dados["Margem %"].fillna(0.0)
+    return dados
+
+
+def carregar_planilha_upload(uploaded_file, precos: pd.DataFrame) -> pd.DataFrame:
+    suffix = Path(uploaded_file.name).suffix or ".xls"
+    info_nome = arquivo_mes_ano(Path(uploaded_file.name))
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(uploaded_file.getbuffer())
+        temp_path = Path(tmp.name)
+    try:
+        if info_nome:
+            info = ArquivoMensal(temp_path, info_nome.mes, info_nome.ano, info_nome.mes_nome)
+        else:
+            info = ArquivoMensal(temp_path, 1, 1900, "UPLOAD")
+        bruto = ler_arquivo_mensal(info)
+        dados = aplicar_calculos_simulacao(bruto, precos)
+        return dados
+    finally:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+
+
+def calcular_previsao_fechamento(dados: pd.DataFrame) -> dict[str, float | int | bool]:
+    if dados.empty:
+        return {
+            "dias_uteis_total": 0,
+            "dias_uteis_realizados": 0,
+            "dias_uteis_restantes": 0,
+            "media_qtd": 0.0,
+            "media_faturamento": 0.0,
+            "previsao_qtd": 0.0,
+            "previsao_faturamento": 0.0,
+            "mes_fechado": False,
+        }
+    data_ref = dados["Data"].max()
+    ano = int(data_ref.year)
+    mes = int(data_ref.month)
+    inicio_mes = pd.Timestamp(year=ano, month=mes, day=1)
+    fim_mes = inicio_mes + pd.offsets.MonthEnd(0)
+    hoje = pd.Timestamp.today().normalize()
+    dias_uteis_total = len(pd.bdate_range(inicio_mes, fim_mes))
+
+    mes_fechado = hoje > fim_mes
+    if mes_fechado:
+        dias_uteis_realizados = dias_uteis_total
+    elif hoje < inicio_mes:
+        dias_uteis_realizados = 0
+    else:
+        dias_uteis_realizados = len(pd.bdate_range(inicio_mes, min(hoje, fim_mes)))
+
+    qtd_realizada = len(dados)
+    faturamento_realizado = dados["Valor Considerado"].sum()
+    if mes_fechado or dias_uteis_realizados == 0:
+        previsao_qtd = float(qtd_realizada)
+        previsao_faturamento = float(faturamento_realizado)
+        media_qtd = qtd_realizada / dias_uteis_total if dias_uteis_total else 0.0
+        media_faturamento = faturamento_realizado / dias_uteis_total if dias_uteis_total else 0.0
+    else:
+        media_qtd = qtd_realizada / dias_uteis_realizados
+        media_faturamento = faturamento_realizado / dias_uteis_realizados
+        previsao_qtd = media_qtd * dias_uteis_total
+        previsao_faturamento = media_faturamento * dias_uteis_total
+
+    return {
+        "dias_uteis_total": dias_uteis_total,
+        "dias_uteis_realizados": dias_uteis_realizados,
+        "dias_uteis_restantes": max(dias_uteis_total - dias_uteis_realizados, 0),
+        "media_qtd": media_qtd,
+        "media_faturamento": media_faturamento,
+        "previsao_qtd": previsao_qtd,
+        "previsao_faturamento": previsao_faturamento,
+        "mes_fechado": mes_fechado,
+    }
+
+
+def resumir(df: pd.DataFrame, grupo: str | list[str]) -> pd.DataFrame:
+    tabela = (
+        df.groupby(grupo, dropna=False)
+        .agg(
+            Quantidade=("Pedido", "count"),
+            Faturamento=("Valor Considerado", "sum"),
+            Custo=("Custo", "sum"),
+            Margem_Bruta=("Margem Bruta", "sum"),
+        )
+        .reset_index()
+    )
+    tabela["Margem_%"] = tabela["Margem_Bruta"] / tabela["Faturamento"].replace(0, pd.NA)
+    tabela["Margem_%"] = tabela["Margem_%"].fillna(0.0)
+    return tabela.sort_values(["Faturamento", "Quantidade"], ascending=False)
+
+
+def filtrar_periodo(df: pd.DataFrame, anos: Iterable[int], meses: Iterable[int], inicio, fim) -> pd.DataFrame:
+    filtrado = df[df["Ano"].isin(list(anos)) & df["Mes"].isin(list(meses))].copy()
+    if inicio:
+        filtrado = filtrado[filtrado["Data"] >= pd.to_datetime(inicio)]
+    if fim:
+        filtrado = filtrado[filtrado["Data"] <= pd.to_datetime(fim)]
+    return filtrado
+
+
+def lista_renovacoes(dados: pd.DataFrame, ano_base: int, meses_base: Iterable[int]) -> pd.DataFrame:
+    meses_base = [int(mes) for mes in meses_base]
+    base = dados[(dados["Ano"] == ano_base) & (dados["Mes"].isin(meses_base))].copy()
+    prox = dados[(dados["Ano"] == ano_base + 1) & (dados["Documento Limpo"].astype(str).str.len() > 0)].copy()
+    renovados = set(prox["Documento Limpo"].dropna())
+    base["Status Renovacao"] = base["Documento Limpo"].map(
+        lambda doc: "Renovou" if str(doc).strip() and doc in renovados else "Pendente"
+    )
+    primeira_renovacao = (
+        prox.sort_values("Data").drop_duplicates("Documento Limpo").set_index("Documento Limpo")["Data"].to_dict()
+    )
+    base["Data Renovacao"] = pd.to_datetime(base["Documento Limpo"].map(primeira_renovacao), errors="coerce")
+    base["Mes Base"] = base["Mes"].map(NOMES_MESES)
+    base["Mes Renovacao"] = base["Data Renovacao"].dt.month.map(NOMES_MESES)
+    colunas = [
+        "Status Renovacao",
+        "Mes Base",
+        "Data",
+        "Data Renovacao",
+        "Mes Renovacao",
+        "Nome",
+        "CPF/CNPJ",
+        "Parceiro",
+        "Origem",
+        "Modelo",
+        "Vendedor",
+        "AGR",
+        "Nome do AVP",
+        "Valor Considerado",
+        "Margem Bruta",
+    ]
+    return base[colunas].sort_values(["Status Renovacao", "Data", "Nome"])
+
+
+def resumo_renovacoes_periodo(dados: pd.DataFrame, anos: Iterable[int], meses: Iterable[int]) -> tuple[pd.DataFrame, int, int]:
+    linhas = []
+    total_base = 0
+    total_renovou = 0
+    anos_disponiveis = set(dados["Ano"].dropna().astype(int).unique())
+    for ano in sorted(int(a) for a in anos):
+        if ano + 1 not in anos_disponiveis:
+            continue
+        prox = dados[(dados["Ano"] == ano + 1) & (dados["Documento Limpo"].astype(str).str.len() > 0)]
+        renovados = set(prox["Documento Limpo"].dropna())
+        for mes in sorted(int(m) for m in meses):
+            base = dados[(dados["Ano"] == ano) & (dados["Mes"] == mes)].copy()
+            if base.empty:
+                continue
+            status = base["Documento Limpo"].map(lambda doc: bool(str(doc).strip()) and doc in renovados)
+            qtd_base = len(base)
+            qtd_renovou = int(status.sum())
+            total_base += qtd_base
+            total_renovou += qtd_renovou
+            linhas.append(
+                {
+                    "Ano base": ano,
+                    "Mes base": NOMES_MESES.get(mes, str(mes)),
+                    "Base": qtd_base,
+                    "Renovados": qtd_renovou,
+                    "Pendentes": qtd_base - qtd_renovou,
+                    "% Renovacao": 0 if qtd_base == 0 else qtd_renovou / qtd_base,
+                }
+            )
+    return pd.DataFrame(linhas), total_base, total_renovou
+
+
+def cli_check(pasta: Path) -> int:
+    dados, precos = carregar_dados(pasta)
+    print(f"Pasta analisada: {pasta}")
+    print(f"Planilhas mensais encontradas: {len(localizar_planilhas(pasta))}")
+    print(f"Planilhas AVP encontradas: {len(localizar_planilhas_avp(pasta))}")
+    print(f"Registros carregados: {len(dados)}")
+    print(f"Parceiros com preco cadastrado: {len(precos)}")
+    if dados.empty:
+        print("Nenhum dado encontrado. Confira se os arquivos seguem o padrao: JANEIRO 2025.xls")
+        return 1
+    print(f"Periodo dos dados: {dados['Data'].min().date()} a {dados['Data'].max().date()}")
+    print(f"Faturamento total considerado: {formatar_moeda(dados['Valor Considerado'].sum())}")
+    print(f"Quantidade total: {len(dados)}")
+    print(f"Margem bruta total: {formatar_moeda(dados['Margem Bruta'].sum())}")
+    ausentes = dados["Preco Parceiro Ausente"].sum()
+    if ausentes:
+        print(f"Atencao: {ausentes} vendas de parceiro estao sem preco na planilha PARCEIROS.")
+    return 0
+
+
+def exigir_streamlit():
+    try:
+        import plotly.express as px
+        import plotly.graph_objects as go
+        import streamlit as st
+
+        return st, px, go
+    except ModuleNotFoundError as exc:
+        pacote = exc.name
+        print(
+            f"O pacote '{pacote}' nao esta instalado. Rode: pip install -r requirements.txt\n"
+            "Depois abra o dashboard com: streamlit run analise_mycert.py",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
+def tabela_formatada(df: pd.DataFrame) -> pd.DataFrame:
+    saida = df.copy()
+    for col in ["Faturamento", "Custo", "Margem_Bruta", "Valor Considerado", "Margem Bruta"]:
+        if col in saida.columns:
+            saida[col] = saida[col].map(formatar_moeda)
+    for col in ["Margem_%", "Margem %", "Atingimento %", "% Renovacao"]:
+        if col in saida.columns:
+            saida[col] = (saida[col].astype(float) * 100).map(formatar_percentual)
+    return saida
+
+
+def gauge(go, titulo: str, valor_atual: float, valor_meta: float):
+    atingimento = 0.0 if valor_meta == 0 else min((valor_atual / valor_meta) * 100, 200)
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=atingimento,
+            number={"suffix": "%"},
+            title={"text": titulo},
+            gauge={
+                "axis": {"range": [0, 150]},
+                "bar": {"color": "#1f77b4"},
+                "steps": [
+                    {"range": [0, 70], "color": "#f8d7da"},
+                    {"range": [70, 100], "color": "#fff3cd"},
+                    {"range": [100, 150], "color": "#d1e7dd"},
+                ],
+                "threshold": {"line": {"color": "#198754", "width": 4}, "thickness": 0.75, "value": 100},
+            },
+        )
+    )
+    fig.update_layout(height=260, margin=dict(l=20, r=20, t=45, b=10))
+    return fig
+
+
+def aplicar_estilo_dashboard(st):
+    st.markdown(
+        """
+        <style>
+            .block-container {
+                padding-top: 1.4rem;
+                padding-bottom: 2rem;
+            }
+            div[data-testid="stMetric"] {
+                background: #ffffff;
+                border: 1px solid #e6edf3;
+                border-radius: 12px;
+                padding: 16px 18px;
+                box-shadow: 0 8px 22px rgba(15, 23, 42, 0.06);
+            }
+            div[data-testid="stMetric"] label {
+                color: #64748b;
+                font-weight: 700;
+            }
+            div[data-testid="stMetricValue"] {
+                color: #0f172a;
+                font-weight: 800;
+            }
+            .dashboard-hero {
+                background: linear-gradient(135deg, #020617 0%, #052e16 54%, #16a34a 100%);
+                border-radius: 16px;
+                padding: 22px 26px;
+                color: #ffffff;
+                margin-bottom: 18px;
+                box-shadow: 0 12px 30px rgba(15, 23, 42, 0.18);
+            }
+            .dashboard-hero h1 {
+                margin: 0;
+                font-size: 30px;
+                line-height: 1.15;
+            }
+            .dashboard-hero p {
+                margin: 8px 0 0 0;
+                color: rgba(255,255,255,0.82);
+                font-size: 14px;
+            }
+            .kpi-card {
+                background: #ffffff;
+                border: 1px solid #e6edf3;
+                border-radius: 14px;
+                padding: 16px 18px;
+                box-shadow: 0 8px 22px rgba(15, 23, 42, 0.06);
+                min-height: 122px;
+            }
+            .kpi-label {
+                color: #64748b;
+                font-size: 13px;
+                font-weight: 800;
+                text-transform: uppercase;
+                letter-spacing: .03em;
+            }
+            .kpi-value {
+                color: #0f172a;
+                font-size: 26px;
+                font-weight: 850;
+                margin-top: 8px;
+                white-space: nowrap;
+            }
+            .kpi-sub {
+                color: #475569;
+                font-size: 13px;
+                margin-top: 6px;
+            }
+            .section-title {
+                font-size: 18px;
+                font-weight: 850;
+                color: #0f172a;
+                margin: 8px 0 10px 0;
+            }
+            button[data-baseweb="tab"] {
+                background: #f8fafc;
+                border: 1px solid #d1fae5;
+                border-radius: 10px 10px 0 0;
+                padding: 12px 18px;
+                margin-right: 5px;
+                color: #052e16;
+                font-weight: 850;
+            }
+            button[data-baseweb="tab"][aria-selected="true"] {
+                background: #052e16;
+                color: #ffffff;
+                border-color: #052e16;
+            }
+            button[data-baseweb="tab"]:hover {
+                background: #dcfce7;
+                color: #052e16;
+            }
+            button[kind="primary"], div.stDownloadButton > button {
+                background: #16a34a;
+                border-color: #16a34a;
+                color: #ffffff;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
-    if base.empty:
-        return pd.DataFrame(
-            columns=[
-                "Documento_Normalizado",
-                "CPF_CNPJ",
-                "Tipo_Documento",
-                "Nome_Separado",
-                "Ultima_Data_2025",
-                "Qtd_Certificados_2025",
-                "Valor_Total_2025",
-                "Ultimo_Modelo_2025",
-                "Ultimo_Vendedor_2025",
-                "Status_Renovacao",
+
+def card_kpi(st, titulo: str, valor: str, subtitulo: str):
+    st.markdown(
+        f"""
+        <div class="kpi-card">
+            <div class="kpi-label">{titulo}</div>
+            <div class="kpi-value">{valor}</div>
+            <div class="kpi-sub">{subtitulo}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def dinheiro_plotly(fig, eixo: str = "y"):
+    if eixo == "x":
+        fig.update_xaxes(tickprefix="R$ ", separatethousands=True)
+    else:
+        fig.update_yaxes(tickprefix="R$ ", separatethousands=True)
+    return fig
+
+
+def app_simulacao(st, px, go, pasta_padrao: Path):
+    st.markdown(
+        """
+        <div class="dashboard-hero">
+            <h1>SIMULAÇÃO</h1>
+            <p>Analise uma planilha avulsa, compare metas e projete o fechamento por dias uteis.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.sidebar.expander("Apoio da simulacao", expanded=True):
+        pasta_txt = st.text_input("Pasta com PARCEIROS", value=str(pasta_padrao), key="sim_pasta_apoio")
+        pasta = Path(pasta_txt).expanduser()
+        if not pasta.exists():
+            st.error("Pasta de apoio nao encontrada.")
+            return
+
+    precos = carregar_precos_parceiros(pasta)
+    upload = st.file_uploader("Suba a planilha do mes para simular", type=["xls", "xlsx", "html", "htm"])
+    if upload is None:
+        st.info("Envie uma planilha mensal para iniciar a simulacao.")
+        return
+
+    try:
+        dados_sim = carregar_planilha_upload(upload, precos)
+    except Exception as exc:
+        st.error(f"Nao consegui ler a planilha enviada: {exc}")
+        return
+
+    if dados_sim.empty:
+        st.warning("A planilha enviada nao trouxe registros validos.")
+        return
+
+    periodo_txt = f"{dados_sim['Data'].min().date().strftime('%d/%m/%Y')} a {dados_sim['Data'].max().date().strftime('%d/%m/%Y')}"
+    st.caption(f"Arquivo carregado: {upload.name} | Periodo identificado: {periodo_txt}")
+
+    with st.expander("Metas da simulacao", expanded=True):
+        m1, m2 = st.columns(2)
+        meta_qtd = m1.number_input("Meta em quantidade de certificados", min_value=0, value=0, step=1)
+        meta_valor = m2.number_input("Meta em faturamento (R$)", min_value=0.0, value=0.0, step=1000.0, format="%.2f")
+
+    total_faturamento = dados_sim["Valor Considerado"].sum()
+    total_qtd = len(dados_sim)
+    margem = dados_sim["Margem Bruta"].sum()
+    ticket = total_faturamento / total_qtd if total_qtd else 0
+    parceiros = dados_sim[dados_sim["Origem Normalizada"].eq("PARCEIRO")]
+    interno = dados_sim[dados_sim["Origem Normalizada"].ne("PARCEIRO")]
+
+    previsao = calcular_previsao_fechamento(dados_sim)
+    previsao_qtd = previsao["previsao_qtd"]
+    previsao_fat = previsao["previsao_faturamento"]
+
+    k1, k2, k3 = st.columns(3)
+    with k1:
+        card_kpi(
+            st,
+            "Realizado geral",
+            formatar_moeda(total_faturamento),
+            f"{total_qtd:,}".replace(",", ".") + f" certificados | ticket {formatar_moeda(ticket)}",
+        )
+    with k2:
+        card_kpi(
+            st,
+            "Previsao fechamento",
+            formatar_moeda(previsao_fat),
+            f"{previsao_qtd:.0f} certificados | {previsao['dias_uteis_restantes']} dias uteis restantes",
+        )
+    with k3:
+        card_kpi(
+            st,
+            "Margem bruta",
+            formatar_moeda(margem),
+            f"Custo unitario {formatar_moeda(CUSTO_CERTIFICADO)}",
+        )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Faturamento parceiros", formatar_moeda(parceiros["Valor Considerado"].sum()), f"{len(parceiros)} certificados")
+    c2.metric("Faturamento interno", formatar_moeda(interno["Valor Considerado"].sum()), f"{len(interno)} certificados")
+    c3.metric("Dias uteis realizados", previsao["dias_uteis_realizados"])
+    c4.metric("Media diaria faturamento", formatar_moeda(previsao["media_faturamento"]))
+
+    st.markdown('<div class="section-title">Meta x realizado x previsao</div>', unsafe_allow_html=True)
+    g1, g2 = st.columns(2)
+    g1.plotly_chart(gauge(go, "Atingimento da meta de faturamento", total_faturamento, meta_valor), use_container_width=True)
+    g2.plotly_chart(gauge(go, "Atingimento da meta de quantidade", total_qtd, meta_qtd), use_container_width=True)
+
+    comp_meta = pd.DataFrame(
+        [
+            {
+                "Indicador": "Faturamento",
+                "Meta": formatar_moeda(meta_valor),
+                "Realizado": formatar_moeda(total_faturamento),
+                "Previsao fechamento": formatar_moeda(previsao_fat),
+                "% Realizado": formatar_percentual((0 if meta_valor == 0 else total_faturamento / meta_valor) * 100),
+                "% Previsto": formatar_percentual((0 if meta_valor == 0 else previsao_fat / meta_valor) * 100),
+            },
+            {
+                "Indicador": "Quantidade",
+                "Meta": f"{int(meta_qtd):,}".replace(",", "."),
+                "Realizado": f"{total_qtd:,}".replace(",", "."),
+                "Previsao fechamento": f"{previsao_qtd:.0f}",
+                "% Realizado": formatar_percentual((0 if meta_qtd == 0 else total_qtd / meta_qtd) * 100),
+                "% Previsto": formatar_percentual((0 if meta_qtd == 0 else previsao_qtd / meta_qtd) * 100),
+            },
+        ]
+    )
+    mostrar_tabela(st, comp_meta, use_container_width=True, hide_index=True)
+
+    if previsao["mes_fechado"]:
+        st.success("Mes fechado: a previsao de fechamento foi igualada ao realizado.")
+
+    faltantes = dados_sim[dados_sim["Preco Parceiro Ausente"]]
+    if not faltantes.empty:
+        with st.expander("Parceiros sem preco encontrado", expanded=False):
+            mostrar_tabela(st, tabela_formatada(resumir(faltantes, "Parceiro")), use_container_width=True, hide_index=True)
+
+    tab_geral, tab_parceiros, tab_agr, tab_tipo, tab_dias, tab_dados = st.tabs(
+        ["Geral", "Parceiros", "AGR", "CPF x CNPJ", "Dias", "Dados"]
+    )
+
+    with tab_geral:
+        por_origem = resumir(dados_sim, "Origem")
+        ctab1, ctab2 = st.columns([1, 1])
+        with ctab1:
+            mostrar_tabela(st, tabela_formatada(por_origem), use_container_width=True, hide_index=True)
+        fig = px.bar(
+            por_origem,
+            x="Origem",
+            y="Faturamento",
+            text=por_origem["Faturamento"].map(formatar_moeda),
+            color="Origem",
+            color_discrete_sequence=["#16a34a", "#052e16", "#22c55e"],
+        )
+        fig.update_layout(yaxis_title="Faturamento", xaxis_title="", plot_bgcolor="#ffffff")
+        dinheiro_plotly(fig, "y")
+        ctab2.plotly_chart(fig, use_container_width=True)
+
+    with tab_parceiros:
+        if parceiros.empty:
+            st.info("Sem vendas de parceiros na planilha enviada.")
+        else:
+            performance = resumir(parceiros, "Parceiro")
+            mostrar_tabela(st, tabela_formatada(performance), use_container_width=True, hide_index=True, height=420)
+            top_fat = performance.head(10).sort_values("Faturamento")
+            fig = px.bar(
+                top_fat,
+                x="Faturamento",
+                y="Parceiro",
+                orientation="h",
+                title="Top parceiros por faturamento",
+                color_discrete_sequence=["#16a34a"],
+            )
+            fig.update_layout(plot_bgcolor="#ffffff")
+            dinheiro_plotly(fig, "x")
+            st.plotly_chart(fig, use_container_width=True)
+
+    with tab_agr:
+        ranking_agr = resumir(dados_sim, "AGR")
+        mostrar_tabela(st, tabela_formatada(ranking_agr), use_container_width=True, hide_index=True, height=420)
+
+    with tab_tipo:
+        por_tipo = resumir(dados_sim, "Tipo")
+        t1, t2 = st.columns([1, 1])
+        with t1:
+            mostrar_tabela(st, tabela_formatada(por_tipo), use_container_width=True, hide_index=True)
+        t2.plotly_chart(px.pie(por_tipo, names="Tipo", values="Quantidade", title="Quantidade por tipo"), use_container_width=True)
+
+    with tab_dias:
+        dias = (
+            dados_sim.groupby("Data")
+            .agg(Quantidade=("Pedido", "count"), Faturamento=("Valor Considerado", "sum"))
+            .reset_index()
+            .sort_values("Data")
+        )
+        fig = px.line(dias, x="Data", y="Faturamento", markers=True, title="Faturamento por dia")
+        fig.update_layout(plot_bgcolor="#ffffff")
+        dinheiro_plotly(fig, "y")
+        st.plotly_chart(fig, use_container_width=True)
+        mostrar_tabela(st, tabela_formatada(dias), use_container_width=True, hide_index=True)
+
+    with tab_dados:
+        mostrar_tabela(st, dados_sim, use_container_width=True, hide_index=True)
+
+
+def app_streamlit(pasta_padrao: Path):
+    st, px, go = exigir_streamlit()
+    st.set_page_config(page_title="Analise de Resultados My Cert", layout="wide")
+    aplicar_estilo_dashboard(st)
+
+    if "pagina_atual" not in st.session_state:
+        st.session_state["pagina_atual"] = "Dashboard"
+
+    with st.sidebar:
+        st.markdown("### Menu")
+        dashboard_tipo = "primary" if st.session_state["pagina_atual"] == "Dashboard" else "secondary"
+        simulacao_tipo = "primary" if st.session_state["pagina_atual"] == "SIMULAÇÃO" else "secondary"
+        if st.button("Dashboard", type=dashboard_tipo, use_container_width=True):
+            st.session_state["pagina_atual"] = "Dashboard"
+        if st.button("SIMULAÇÃO", type=simulacao_tipo, use_container_width=True):
+            st.session_state["pagina_atual"] = "SIMULAÇÃO"
+
+    if st.session_state["pagina_atual"] == "SIMULAÇÃO":
+        app_simulacao(st, px, go, pasta_padrao)
+        return
+
+    st.markdown(
+        """
+        <div class="dashboard-hero">
+            <h1>Analise de Resultados My Cert</h1>
+            <p>Faturamento, margem, parceiros, AGR, renovacoes e comparativo ano -1 em uma visao executiva.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.sidebar:
+        st.header("Controles")
+        mostrar_filtros = st.toggle("Exibir filtros", value=True)
+        pasta_txt = st.text_input("Pasta das planilhas", value=str(pasta_padrao))
+        pasta = Path(pasta_txt).expanduser()
+        if not pasta.exists():
+            st.error("Pasta nao encontrada.")
+            st.stop()
+
+    dados, precos = carregar_dados(pasta)
+    qtd_avp = int(dados.get("AVP Encontrado", pd.Series(dtype=bool)).sum()) if not dados.empty else 0
+    total_registros = len(dados) if not dados.empty else 0
+    if total_registros:
+        st.caption(f"AVP aplicado em {qtd_avp:,} de {total_registros:,} registros via Protocolo.".replace(",", "."))
+    if dados.empty:
+        st.warning("Nenhuma planilha mensal encontrada no padrao: JANEIRO 2025, FEVEREIRO 2025...")
+        st.stop()
+
+    anos_disponiveis = sorted(dados["Ano"].dropna().unique().tolist())
+    meses_disponiveis = sorted(dados["Mes"].dropna().unique().tolist())
+    data_min = dados["Data"].min().date()
+    data_max = dados["Data"].max().date()
+    origens_disponiveis = sorted(dados["Origem"].unique())
+    tipos_disponiveis = sorted(dados["Tipo"].unique())
+
+    anos = anos_disponiveis
+    meses = meses_disponiveis
+    inicio, fim = data_min, data_max
+    origem = origens_disponiveis
+    tipo = tipos_disponiveis
+
+    if mostrar_filtros:
+        with st.sidebar.expander("Filtros da analise", expanded=True):
+            anos = st.multiselect("Ano", anos_disponiveis, default=anos_disponiveis)
+            meses = st.multiselect(
+                "Mes",
+                meses_disponiveis,
+                default=meses_disponiveis,
+                format_func=lambda m: NOMES_MESES.get(int(m), str(m)),
+            )
+            periodo = st.date_input(
+                "Periodo por data",
+                value=(data_min, data_max),
+                min_value=data_min,
+                max_value=data_max,
+            )
+            if isinstance(periodo, tuple) and len(periodo) == 2:
+                inicio, fim = periodo
+            origem = st.multiselect("Origem", origens_disponiveis, default=origens_disponiveis)
+            tipo = st.multiselect("Tipo", tipos_disponiveis, default=tipos_disponiveis)
+    else:
+        st.sidebar.caption("Filtros ocultos. Usando a base completa.")
+
+    filtrado = filtrar_periodo(dados, anos, meses, inicio, fim)
+    filtrado = filtrado[filtrado["Origem"].isin(origem) & filtrado["Tipo"].isin(tipo)].copy()
+
+    if filtrado.empty:
+        st.warning("Nenhum registro encontrado para os filtros selecionados.")
+        st.stop()
+
+    total_faturamento = filtrado["Valor Considerado"].sum()
+    total_qtd = len(filtrado)
+    margem = filtrado["Margem Bruta"].sum()
+    margem_pct = 0 if total_faturamento == 0 else margem / total_faturamento
+
+    parceiros = filtrado[filtrado["Origem Normalizada"].eq("PARCEIRO")].copy()
+    interno = filtrado[filtrado["Origem Normalizada"].ne("PARCEIRO")].copy()
+    fat_parceiros = parceiros["Valor Considerado"].sum()
+    fat_interno = interno["Valor Considerado"].sum()
+    margem_parceiros = parceiros["Margem Bruta"].sum()
+    margem_interno = interno["Margem Bruta"].sum()
+    ticket_geral = total_faturamento / total_qtd if total_qtd else 0
+    ticket_parceiros = fat_parceiros / len(parceiros) if len(parceiros) else 0
+    ticket_interno = fat_interno / len(interno) if len(interno) else 0
+
+    k1, k2, k3 = st.columns(3)
+    with k1:
+        card_kpi(
+            st,
+            "Faturamento geral",
+            formatar_moeda(total_faturamento),
+            f"{total_qtd:,}".replace(",", ".")
+            + f" certificados | ticket {formatar_moeda(ticket_geral)} | margem {formatar_moeda(margem)}",
+        )
+    with k2:
+        card_kpi(
+            st,
+            "Faturamento parceiros",
+            formatar_moeda(fat_parceiros),
+            f"{len(parceiros):,}".replace(",", ".")
+            + f" certificados | ticket {formatar_moeda(ticket_parceiros)} | margem {formatar_moeda(margem_parceiros)}",
+        )
+    with k3:
+        card_kpi(
+            st,
+            "Faturamento interno",
+            formatar_moeda(fat_interno),
+            f"{len(interno):,}".replace(",", ".")
+            + f" certificados | ticket {formatar_moeda(ticket_interno)} | margem {formatar_moeda(margem_interno)}",
+        )
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Margem bruta geral", formatar_moeda(margem), formatar_percentual(margem_pct * 100))
+    c2.metric("Ticket medio", formatar_moeda(total_faturamento / total_qtd if total_qtd else 0))
+    c3.metric("Custo unitario", formatar_moeda(CUSTO_CERTIFICADO))
+
+    faltantes = filtrado[filtrado["Preco Parceiro Ausente"]]
+    if not faltantes.empty:
+        parceiros_faltantes = resumir(faltantes, "Parceiro")
+        st.warning(
+            f"{len(faltantes)} vendas de parceiro estao sem preco na planilha PARCEIROS. "
+            "Atualize a planilha com os parceiros listados abaixo; enquanto isso, usei o valor da planilha mensal."
+        )
+        with st.expander("Ver parceiros nao encontrados na planilha PARCEIROS", expanded=True):
+            mostrar_tabela(st, tabela_formatada(parceiros_faltantes), use_container_width=True, hide_index=True, height=240)
+            st.download_button(
+                "Baixar parceiros nao encontrados CSV",
+                data=parceiros_faltantes.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+                file_name="parceiros_nao_encontrados.csv",
+                mime="text/csv",
+            )
+
+    tab_geral, tab_parceiros, tab_agr, tab_tipo, tab_dias, tab_renovacao, tab_comparativo, tab_dados = st.tabs(
+        [
+            "Geral",
+            "Parceiros",
+            "AGR",
+            "CPF x CNPJ",
+            "Dias",
+            "Renovacao",
+            "Ano -1",
+            "Dados",
+        ]
+    )
+
+    with tab_geral:
+        st.markdown('<div class="section-title">Faturamento por origem</div>', unsafe_allow_html=True)
+        por_origem = resumir(filtrado, "Origem")
+        g1, g2 = st.columns([1, 1])
+        with g1:
+            mostrar_tabela(st, tabela_formatada(por_origem), use_container_width=True, hide_index=True)
+        fig = px.bar(
+            por_origem,
+            x="Origem",
+            y="Faturamento",
+            text=por_origem["Faturamento"].map(formatar_moeda),
+            color="Origem",
+            color_discrete_sequence=["#16a34a", "#052e16", "#22c55e"],
+        )
+        fig.update_layout(yaxis_title="Faturamento", xaxis_title="", plot_bgcolor="#ffffff")
+        dinheiro_plotly(fig, "y")
+        g2.plotly_chart(fig, use_container_width=True)
+
+    with tab_parceiros:
+        if parceiros.empty:
+            st.info("Sem vendas de parceiros no filtro selecionado.")
+        else:
+            performance = resumir(parceiros, "Parceiro")
+            st.markdown('<div class="section-title">Tabela de performance dos parceiros</div>', unsafe_allow_html=True)
+            mostrar_tabela(
+                st,
+                tabela_formatada(performance),
+                use_container_width=True,
+                hide_index=True,
+                height=420,
+            )
+            p1, p2 = st.columns(2)
+            top_qtd = performance.sort_values("Quantidade", ascending=False).head(10)
+            fig_qtd = px.bar(
+                top_qtd.sort_values("Quantidade"),
+                x="Quantidade",
+                y="Parceiro",
+                orientation="h",
+                title="Top parceiros por quantidade",
+                color_discrete_sequence=["#052e16"],
+            )
+            fig_qtd.update_layout(plot_bgcolor="#ffffff")
+            p1.plotly_chart(fig_qtd, use_container_width=True)
+            top_fat = performance.sort_values("Faturamento", ascending=False).head(10)
+            fig_fat = px.bar(
+                top_fat.sort_values("Faturamento"),
+                x="Faturamento",
+                y="Parceiro",
+                orientation="h",
+                title="Top parceiros por faturamento",
+                color_discrete_sequence=["#16a34a"],
+            )
+            fig_fat.update_layout(plot_bgcolor="#ffffff")
+            dinheiro_plotly(fig_fat, "x")
+            p2.plotly_chart(fig_fat, use_container_width=True)
+
+    with tab_agr:
+        st.markdown('<div class="section-title">Ranking dos AGR</div>', unsafe_allow_html=True)
+        ranking_agr = resumir(filtrado, "AGR")
+        mostrar_tabela(st, tabela_formatada(ranking_agr), use_container_width=True, hide_index=True, height=420)
+        a1, a2 = st.columns(2)
+        top_agr_fat = ranking_agr.head(20).sort_values("Faturamento")
+        fig_agr_fat = px.bar(
+            top_agr_fat,
+            x="Faturamento",
+            y="AGR",
+            orientation="h",
+            title="Top AGR por faturamento",
+            color_discrete_sequence=["#16a34a"],
+        )
+        fig_agr_fat.update_layout(plot_bgcolor="#ffffff")
+        dinheiro_plotly(fig_agr_fat, "x")
+        a1.plotly_chart(fig_agr_fat, use_container_width=True)
+        top_agr_qtd = ranking_agr.sort_values("Quantidade", ascending=False).head(20).sort_values("Quantidade")
+        fig_agr_qtd = px.bar(
+            top_agr_qtd,
+            x="Quantidade",
+            y="AGR",
+            orientation="h",
+            title="Top AGR por quantidade",
+            color_discrete_sequence=["#052e16"],
+        )
+        fig_agr_qtd.update_layout(plot_bgcolor="#ffffff")
+        a2.plotly_chart(fig_agr_qtd, use_container_width=True)
+
+    with tab_tipo:
+        st.markdown('<div class="section-title">CPF x CNPJ</div>', unsafe_allow_html=True)
+        por_tipo = resumir(filtrado, "Tipo")
+        t1, t2 = st.columns([1, 1])
+        with t1:
+            mostrar_tabela(st, tabela_formatada(por_tipo), use_container_width=True, hide_index=True)
+        t2.plotly_chart(px.pie(por_tipo, names="Tipo", values="Quantidade", title="Quantidade por tipo"), use_container_width=True)
+        tipo_drill = st.selectbox("Drill por tipo", sorted(filtrado["Tipo"].unique()))
+        detalhe_tipo = filtrado[filtrado["Tipo"] == tipo_drill].copy()
+        mostrar_tabela(
+            st,
+            detalhe_tipo[
+                [
+                    "Data",
+                    "Nome",
+                    "CPF/CNPJ",
+                    "Modelo",
+                    "Pedido",
+                    "Origem",
+                    "Parceiro",
+                    "Vendedor",
+                    "Valor Considerado",
+                    "Margem Bruta",
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with tab_dias:
+        st.markdown('<div class="section-title">Movimentacao diaria</div>', unsafe_allow_html=True)
+        dias = (
+            filtrado.groupby("Data")
+            .agg(Quantidade=("Pedido", "count"), Faturamento=("Valor Considerado", "sum"))
+            .reset_index()
+            .sort_values("Data")
+        )
+        top5 = dias.nlargest(5, "Faturamento")
+        fig = px.line(dias, x="Data", y="Faturamento", markers=True, title="Faturamento por dia")
+        fig.add_trace(
+            go.Scatter(
+                x=top5["Data"],
+                y=top5["Faturamento"],
+                mode="markers+text",
+                text=top5["Faturamento"].map(formatar_moeda),
+                textposition="top center",
+                marker=dict(size=12, color="#dc3545"),
+                name="Top 5 dias",
+            )
+        )
+        fig.update_layout(plot_bgcolor="#ffffff")
+        dinheiro_plotly(fig, "y")
+        st.plotly_chart(fig, use_container_width=True)
+        fig_dias_qtd = px.bar(dias, x="Data", y="Quantidade", title="Quantidade por dia", color_discrete_sequence=["#052e16"])
+        fig_dias_qtd.update_layout(plot_bgcolor="#ffffff")
+        st.plotly_chart(fig_dias_qtd, use_container_width=True)
+        mostrar_tabela(st, tabela_formatada(dias), use_container_width=True, hide_index=True)
+
+    with tab_renovacao:
+        st.markdown('<div class="section-title">Lista de renovacao</div>', unsafe_allow_html=True)
+        anos_base = sorted([ano for ano in dados["Ano"].unique() if ano + 1 in set(dados["Ano"].unique())])
+        if not anos_base:
+            st.info("Para gerar renovacao, inclua planilhas de anos consecutivos, por exemplo 2025 e 2026.")
+        else:
+            st.caption("Esta aba usa filtros proprios e ignora o filtro lateral do dashboard.")
+            r1, r2 = st.columns(2)
+            ano_base = r1.selectbox("Ano base", anos_base, index=0)
+            meses_base = sorted(dados.loc[dados["Ano"] == ano_base, "Mes"].unique())
+            meses_base_sel = r2.multiselect(
+                "Meses base",
+                meses_base,
+                default=meses_base,
+                format_func=lambda m: NOMES_MESES.get(int(m), str(m)),
+            )
+            st.caption(
+                "A lista considera como renovado qualquer CPF/CNPJ dos meses base que apareca em qualquer mes do ano seguinte."
+            )
+            if not meses_base_sel:
+                st.info("Selecione pelo menos um mes base para gerar a lista.")
+            else:
+                resumo_renov, base_sel, renov_sel = resumo_renovacoes_periodo(dados, [int(ano_base)], meses_base_sel)
+                pct_sel = 0 if base_sel == 0 else renov_sel / base_sel
+                rsel1, rsel2, rsel3, rsel4 = st.columns(4)
+                rsel1.metric("Base selecionada", f"{base_sel:,}".replace(",", "."))
+                rsel2.metric("Renovados", f"{renov_sel:,}".replace(",", "."))
+                rsel3.metric("Pendentes", f"{base_sel - renov_sel:,}".replace(",", "."))
+                rsel4.metric("% renovacao", formatar_percentual(pct_sel * 100))
+                with st.expander("Resumo de renovacao dos meses selecionados", expanded=False):
+                    mostrar_tabela(st, tabela_formatada(resumo_renov), use_container_width=True, hide_index=True)
+
+                renov = lista_renovacoes(dados, int(ano_base), meses_base_sel)
+                qtd_renovou = (renov["Status Renovacao"] == "Renovou").sum()
+                qtd_pendente = (renov["Status Renovacao"] == "Pendente").sum()
+                rr1, rr2, rr3 = st.columns(3)
+                rr1.metric("Base dos meses", len(renov))
+                rr2.metric(f"Renovados em {int(ano_base) + 1}", qtd_renovou)
+                rr3.metric("Lista para trabalhar", qtd_pendente)
+                status = st.multiselect("Status", ["Pendente", "Renovou"], default=["Pendente", "Renovou"])
+                renov_filtrada = renov[renov["Status Renovacao"].isin(status)]
+                mostrar_tabela(st, renov_filtrada, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Baixar lista de renovacao CSV",
+                    data=renov_filtrada.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+                    file_name=f"lista_renovacao_meses_selecionados_{ano_base}.csv",
+                    mime="text/csv",
+                )
+
+    with tab_comparativo:
+        st.markdown('<div class="section-title">Comparativo com ano -1</div>', unsafe_allow_html=True)
+        anos_filtro = sorted(filtrado["Ano"].unique())
+        ano_atual = st.selectbox("Ano para comparar", anos_filtro, index=len(anos_filtro) - 1)
+        meses_comp = sorted(filtrado.loc[filtrado["Ano"] == ano_atual, "Mes"].unique())
+        atual = filtrado[(filtrado["Ano"] == ano_atual) & (filtrado["Mes"].isin(meses_comp))]
+        anterior = dados[(dados["Ano"] == ano_atual - 1) & (dados["Mes"].isin(meses_comp))]
+        fat_atual = atual["Valor Considerado"].sum()
+        fat_anterior = anterior["Valor Considerado"].sum()
+        qtd_atual = len(atual)
+        qtd_anterior = len(anterior)
+        comp = pd.DataFrame(
+            [
+                {
+                    "Indicador": "Faturamento",
+                    "Ano atual": fat_atual,
+                    "Ano -1": fat_anterior,
+                    "Atingimento %": 0 if fat_anterior == 0 else fat_atual / fat_anterior,
+                },
+                {
+                    "Indicador": "Quantidade",
+                    "Ano atual": qtd_atual,
+                    "Ano -1": qtd_anterior,
+                    "Atingimento %": 0 if qtd_anterior == 0 else qtd_atual / qtd_anterior,
+                },
             ]
         )
-
-    base = base.sort_values(["Documento_Normalizado", "Data_Tratada"])
-    agrupado = (
-        base.groupby("Documento_Normalizado", as_index=False)
-        .agg(
-            CPF_CNPJ=("CPF_CNPJ", "last"),
-            Tipo_Documento=("Tipo_Documento", "last"),
-            Nome_Separado=("Nome_Separado", "last"),
-            Ultima_Data_2025=("Data_Tratada", "max"),
-            Qtd_Certificados_2025=("Pedido_Numero", "count"),
-            Valor_Total_2025=("Valor_Numerico", "sum"),
-            Ultimo_Modelo_2025=("Modelo", "last"),
-            Ultimo_Vendedor_2025=("Vendedor", "last"),
+        c1, c2 = st.columns(2)
+        c1.plotly_chart(gauge(go, "Atingimento faturamento vs ano -1", fat_atual, fat_anterior), use_container_width=True)
+        c2.plotly_chart(gauge(go, "Atingimento quantidade vs ano -1", qtd_atual, qtd_anterior), use_container_width=True)
+        comp_fmt = pd.DataFrame(
+            [
+                {
+                    "Indicador": "Faturamento",
+                    "Ano atual": formatar_moeda(fat_atual),
+                    "Ano -1": formatar_moeda(fat_anterior),
+                    "Atingimento %": formatar_percentual((0 if fat_anterior == 0 else fat_atual / fat_anterior) * 100),
+                },
+                {
+                    "Indicador": "Quantidade",
+                    "Ano atual": f"{qtd_atual:,}".replace(",", "."),
+                    "Ano -1": f"{qtd_anterior:,}".replace(",", "."),
+                    "Atingimento %": formatar_percentual((0 if qtd_anterior == 0 else qtd_atual / qtd_anterior) * 100),
+                },
+            ]
         )
-    )
-    agrupado["Status_Renovacao"] = agrupado["Documento_Normalizado"].astype(str).apply(
-        lambda doc: "RENOVOU EM 2026" if doc in renovados_2026 else "NAO RENOVOU EM 2026"
-    )
-    return agrupado[agrupado["Status_Renovacao"] == "NAO RENOVOU EM 2026"].copy()
+        mostrar_tabela(st, comp_fmt, use_container_width=True, hide_index=True)
 
-
-def ajustar_larguras(ws, max_width=42):
-    for coluna in ws.columns:
-        letra = coluna[0].column_letter
-        maior = 0
-        for celula in coluna:
-            valor = "" if celula.value is None else str(celula.value)
-            maior = max(maior, min(len(valor) + 2, max_width))
-        ws.column_dimensions[letra].width = max(10, maior)
-
-
-def aplicar_estilo_tabela(ws, nome_tabela):
-    used = ws.calculate_dimension()
-    if used == "A1:A1" and ws["A1"].value is None:
-        return
-    tabela = Table(displayName=nome_tabela, ref=used)
-    estilo = TableStyleInfo(
-        name="TableStyleMedium2",
-        showFirstColumn=False,
-        showLastColumn=False,
-        showRowStripes=True,
-        showColumnStripes=False,
-    )
-    tabela.tableStyleInfo = estilo
-    ws.add_table(tabela)
-    ws.freeze_panes = "A2"
-    ajustar_larguras(ws)
-
-
-def montar_aba_indicadores(writer, df):
-    wb = writer.book
-    ws = wb.create_sheet("INDICADORES COMERCIAIS")
-
-    periodos = (
-        df.dropna(subset=["Data_Tratada"])
-        .sort_values("Data_Tratada")["Periodo"]
-        .dropna()
-        .drop_duplicates()
-        .tolist()
-    )
-    if not periodos:
-        periodos = ["SEM DATA"]
-
-    ws_periodos = wb.create_sheet("AUX_PERIODOS")
-    ws_periodos.sheet_state = "hidden"
-    ws_periodos["A1"] = "Periodos"
-    for idx, periodo in enumerate(periodos, start=2):
-        ws_periodos.cell(idx, 1).value = periodo
-
-    ws["A1"] = "INDICADORES COMERCIAIS"
-    ws["A3"] = "Filtro lateral"
-    ws["A4"] = "Periodo"
-    ws["B4"] = periodos[-1]
-
-    validacao = DataValidation(
-        type="list",
-        formula1=f"=AUX_PERIODOS!$A$2:$A${len(periodos) + 1}",
-        allow_blank=False,
-    )
-    ws.add_data_validation(validacao)
-    validacao.add(ws["B4"])
-
-    indicadores = [
-        ("Total de certificados", '=COUNTIF(CONSOLIDADO!$P:$P,$B$4)'),
-        ("Valor total", '=SUMIF(CONSOLIDADO!$P:$P,$B$4,CONSOLIDADO!$T:$T)'),
-        ("Ticket medio", '=IFERROR(B8/B7,0)'),
-        ("Clientes unicos", '=COUNTA(UNIQUE(FILTER(CONSOLIDADO!$R:$R,(CONSOLIDADO!$P:$P=$B$4)*(CONSOLIDADO!$R:$R<>""))))'),
-        ("Certificados CPF", '=COUNTIFS(CONSOLIDADO!$P:$P,$B$4,CONSOLIDADO!$S:$S,"CPF")'),
-        ("Certificados CNPJ", '=COUNTIFS(CONSOLIDADO!$P:$P,$B$4,CONSOLIDADO!$S:$S,"CNPJ")'),
-    ]
-
-    ws["A6"] = "Indicador"
-    ws["B6"] = "Resultado"
-    for linha, (rotulo, formula) in enumerate(indicadores, start=7):
-        ws.cell(linha, 1).value = rotulo
-        ws.cell(linha, 2).value = formula
-
-    ws["D6"] = "Origem"
-    ws["E6"] = "Quantidade"
-    origens = sorted([x for x in df["Origem"].dropna().astype(str).unique() if x.strip()])
-    for linha, origem in enumerate(origens, start=7):
-        ws.cell(linha, 4).value = origem
-        ws.cell(linha, 5).value = f'=COUNTIFS(CONSOLIDADO!$P:$P,$B$4,CONSOLIDADO!$H:$H,D{linha})'
-
-    ws["G6"] = "Vendedor"
-    ws["H6"] = "Quantidade no periodo"
-    vendedores = (
-        df.groupby("Vendedor", dropna=True)["Pedido_Numero"]
-        .count()
-        .sort_values(ascending=False)
-        .head(20)
-        .index.astype(str)
-        .tolist()
-    )
-    for linha, vendedor in enumerate(vendedores, start=7):
-        ws.cell(linha, 7).value = vendedor
-        ws.cell(linha, 8).value = f'=COUNTIFS(CONSOLIDADO!$P:$P,$B$4,CONSOLIDADO!$F:$F,G{linha})'
-
-    ws["J6"] = "Modelo"
-    ws["K6"] = "Quantidade no periodo"
-    modelos = (
-        df.groupby("Modelo", dropna=True)["Pedido_Numero"]
-        .count()
-        .sort_values(ascending=False)
-        .head(20)
-        .index.astype(str)
-        .tolist()
-    )
-    for linha, modelo in enumerate(modelos, start=7):
-        ws.cell(linha, 10).value = modelo
-        ws.cell(linha, 11).value = f'=COUNTIFS(CONSOLIDADO!$P:$P,$B$4,CONSOLIDADO!$C:$C,J{linha})'
-
-    # Ranking AGR/AVP: agora o AGR considerado no dashboard e o Nome do AVP
-    ws["M6"] = "AGR / Nome do AVP"
-    ws["N6"] = "Quantidade no periodo"
-    col_periodo = coluna_excel(df, "Periodo")
-    col_agr = coluna_excel(df, "AGR")
-    avps = []
-    if "AGR" in df.columns:
-        avps = (
-            df.loc[df["AGR"].fillna("").astype(str).str.strip() != ""]
-            .groupby("AGR", dropna=True)["Pedido_Numero"]
-            .count()
-            .sort_values(ascending=False)
-            .head(20)
-            .index.astype(str)
-            .tolist()
+    with tab_dados:
+        st.subheader("Base filtrada")
+        mostrar_tabela(st, filtrado, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Baixar base filtrada CSV",
+            data=filtrado.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+            file_name="base_filtrada_mycert.csv",
+            mime="text/csv",
         )
-    for linha, avp in enumerate(avps, start=7):
-        ws.cell(linha, 13).value = avp
-        if col_periodo and col_agr:
-            ws.cell(linha, 14).value = f'=COUNTIFS(CONSOLIDADO!${col_periodo}:${col_periodo},$B$4,CONSOLIDADO!${col_agr}:${col_agr},M{linha})'
-        else:
-            ws.cell(linha, 14).value = ""
-
-    ws["A15"] = "Ao alterar o periodo em B4, os indicadores desta aba sao recalculados no Excel."
-
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    title_fill = PatternFill("solid", fgColor="D9EAF7")
-    white_font = Font(color="FFFFFF", bold=True)
-    thin = Side(style="thin", color="D9E2F3")
-
-    ws["A1"].font = Font(size=16, bold=True, color="1F4E78")
-    ws["A3"].font = Font(bold=True, color="1F4E78")
-    ws["A3"].fill = title_fill
-    ws["A4"].font = Font(bold=True)
-    ws["B4"].fill = PatternFill("solid", fgColor="FFF2CC")
-
-    for row in (6,):
-        for col in range(1, 15):
-            cell = ws.cell(row, col)
-            if cell.value:
-                cell.fill = header_fill
-                cell.font = white_font
-                cell.alignment = Alignment(horizontal="center")
-
-    for row in ws.iter_rows(min_row=6, max_row=max(ws.max_row, 26), min_col=1, max_col=14):
-        for cell in row:
-            cell.border = Border(top=thin, left=thin, right=thin, bottom=thin)
-
-    for cell in ["B8", "B9"]:
-        ws[cell].number_format = 'R$ #,##0.00'
-
-    ajustar_larguras(ws)
-    ws.column_dimensions["A"].width = 24
-    ws.column_dimensions["B"].width = 20
-    ws.freeze_panes = "A6"
 
 
-def salvar_com_indicadores(df_final, lista_renovacao, caminho_saida):
-    with pd.ExcelWriter(caminho_saida, engine="openpyxl") as writer:
-        df_final.to_excel(writer, index=False, sheet_name="CONSOLIDADO")
-        lista_renovacao.to_excel(writer, index=False, sheet_name="LISTA RENOVACAO")
-
-        wb = writer.book
-        ws_consolidado = wb["CONSOLIDADO"]
-        ws_renovacao = wb["LISTA RENOVACAO"]
-
-        aplicar_estilo_tabela(ws_consolidado, "TabelaConsolidado")
-        aplicar_estilo_tabela(ws_renovacao, "TabelaRenovacao")
-        montar_aba_indicadores(writer, df_final)
-
-        ws_renovacao["A1"].comment = None
-        if ws_renovacao.max_row > 1:
-            for cell in ws_renovacao[1]:
-                cell.fill = PatternFill("solid", fgColor="C00000")
-                cell.font = Font(color="FFFFFF", bold=True)
-            for row in ws_renovacao.iter_rows(min_row=2, max_row=ws_renovacao.max_row):
-                row[-1].fill = PatternFill("solid", fgColor="FCE4D6")
-                row[-1].font = Font(bold=True, color="9C0006")
-        ajustar_larguras(ws_renovacao)
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Dashboard de analise de resultados da My Cert.")
+    parser.add_argument("--pasta", default=".", help="Pasta onde estao as planilhas mensais e a planilha PARCEIROS.")
+    parser.add_argument("--check", action="store_true", help="Valida a leitura dos arquivos e mostra um resumo no CMD.")
+    args = parser.parse_args()
+    pasta = Path(args.pasta).expanduser().resolve()
+    if args.check:
+        return cli_check(pasta)
+    app_streamlit(pasta)
+    return 0
 
 
-# ============================================================
-# PROCESSAMENTO
-# ============================================================
-
-arquivos = glob(os.path.join(PASTA, "*.xls")) + glob(os.path.join(PASTA, "*.xlsx"))
-arquivos_avp = [a for a in arquivos if nome_arquivo_eh_base_avp(os.path.basename(a))]
-arquivos_principais = [a for a in arquivos if a not in arquivos_avp]
-
-lista_df = []
-base_avp = carregar_base_avp(arquivos_avp)
-
-print("=" * 70)
-print("INICIANDO CONSOLIDACAO")
-print("=" * 70)
-
-for arquivo in arquivos_principais:
-    nome_arquivo = os.path.basename(arquivo)
-
-    if ARQUIVO_SAIDA.upper() in nome_arquivo.upper():
-        continue
-
-    print(f"Lendo arquivo: {nome_arquivo}")
-
-    try:
-        df = ler_arquivo(arquivo)
-
-        df = df.dropna(how="all").reset_index(drop=True)
-
-        if df.empty:
-            print(f"Arquivo vazio ignorado: {nome_arquivo}")
-            continue
-
-        col_nome = localizar_coluna(df, "Nome", 1)
-        col_pedido = localizar_coluna(df, "Pedido", 3)
-
-        df[["Nome_Separado", "CPF_CNPJ", "Parceiro"]] = df[col_nome].apply(extrair_nome_cpf_parceiro)
-        df[["Pedido_Numero", "Emissor"]] = df[col_pedido].apply(extrair_pedido_emissor)
-
-        df["Arquivo_Origem"] = nome_arquivo
-
-        lista_df.append(df)
-
-        print(f"OK -> {nome_arquivo} | Linhas: {len(df)}")
-
-    except Exception as e:
-        print(f"ERRO -> {nome_arquivo}: {e}")
-
-if not lista_df:
-    print("=" * 70)
-    print("Nenhum arquivo foi processado com sucesso.")
-    print("=" * 70)
-else:
-    df_final = pd.concat(lista_df, ignore_index=True)
-    df_final = preparar_campos_indicadores(df_final)
-    df_final = aplicar_avp_no_consolidado(df_final, base_avp)
-    lista_renovacao = criar_lista_renovacao(df_final)
-
-    saida = os.path.join(PASTA, ARQUIVO_SAIDA)
-    try:
-        salvar_com_indicadores(df_final, lista_renovacao, saida)
-    except PermissionError:
-        saida = os.path.join(PASTA, "CONSOLIDADO_FINAL_INDICADORES.xlsx")
-        salvar_com_indicadores(df_final, lista_renovacao, saida)
-
-    print("=" * 70)
-    print("CONSOLIDADO GERADO COM SUCESSO")
-    print(f"Arquivo: {saida}")
-    print(f"Total de linhas consolidadas: {len(df_final)}")
-    print(f"Clientes sem renovacao 2026: {len(lista_renovacao)}")
-    print("Abas adicionadas: INDICADORES COMERCIAIS e LISTA RENOVACAO")
-    print("=" * 70)
-
-input("Pressione ENTER para sair...")
+if __name__ == "__main__":
+    raise SystemExit(main())
