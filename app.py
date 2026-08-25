@@ -436,6 +436,24 @@ def classificar_tipo(modelo: object, documento: object) -> str:
     return "Nao identificado"
 
 
+def assinatura_pasta_dados(pasta: Path) -> tuple[tuple[str, int, int], ...]:
+    """Assinatura barata da pasta para invalidar o cache apenas quando os arquivos mudarem."""
+    extensoes = {".xls", ".xlsx", ".csv", ".html", ".htm"}
+    assinatura = []
+    try:
+        for caminho in pasta.iterdir():
+            if not caminho.is_file() or caminho.suffix.lower() not in extensoes:
+                continue
+            try:
+                stat = caminho.stat()
+                assinatura.append((caminho.name, stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                continue
+    except OSError:
+        return tuple()
+    return tuple(sorted(assinatura))
+
+
 def carregar_dados(pasta: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     arquivos = localizar_planilhas(pasta)
     frames = [ler_arquivo_mensal(info) for info in arquivos]
@@ -1070,6 +1088,13 @@ def app_simulacao(st, px, go, pasta_padrao: Path):
 
 def app_streamlit(pasta_padrao: Path):
     st, px, go = exigir_streamlit()
+
+    @st.cache_data(show_spinner=False, max_entries=8)
+    def carregar_dados_cacheado(pasta_str: str, assinatura):
+        # A assinatura participa da chave do cache. Se qualquer arquivo mudar,
+        # o Streamlit recarrega a base; em interacoes comuns, reutiliza a memoria.
+        return carregar_dados(Path(pasta_str))
+
     st.set_page_config(page_title="Analise de Resultados My Cert", layout="wide")
     aplicar_estilo_dashboard(st)
 
@@ -1108,7 +1133,9 @@ def app_streamlit(pasta_padrao: Path):
             st.error("Pasta nao encontrada.")
             st.stop()
 
-    dados, precos = carregar_dados(pasta)
+    assinatura = assinatura_pasta_dados(pasta)
+    with st.spinner("Carregando base..."):
+        dados, precos = carregar_dados_cacheado(str(pasta.resolve()), assinatura)
     qtd_avp = int(dados.get("AVP Encontrado", pd.Series(dtype=bool)).sum()) if not dados.empty else 0
     total_registros = len(dados) if not dados.empty else 0
     if total_registros:
