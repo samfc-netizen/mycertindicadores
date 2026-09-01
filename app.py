@@ -246,7 +246,10 @@ def carregar_mapa_avp(pasta: Path) -> pd.DataFrame:
         try:
             df = ler_tabela_generica(info.caminho)
             col_protocolo = localizar_coluna_flexivel(df, ["Protocolo"])
-            col_avp = localizar_coluna_flexivel(df, ["Nome do AVP", "Nome AVP", "AVP"])
+            # A coluna N da planilha AGO/AGOSTO e "Nome do AVP" e e a fonte oficial do AGR.
+            col_avp = "Nome do AVP" if "Nome do AVP" in df.columns else localizar_coluna_flexivel(
+                df, ["Nome do AVP", "Nome AVP", "AVP"]
+            )
             if col_protocolo is None or col_avp is None:
                 continue
             base = df[[col_protocolo, col_avp]].copy()
@@ -313,29 +316,47 @@ def _encontrar_avp_por_nome(agr_original: object, candidatos: list[tuple[str, st
 
 
 def aplicar_avp_no_agr(dados: pd.DataFrame, pasta: Path) -> pd.DataFrame:
+    """
+    Define o AGR EXCLUSIVAMENTE pela coluna "Nome do AVP" da planilha AGO/AGOSTO.
+
+    Regra de negocio:
+    - Protocolo da venda -> coluna A (Protocolo) da planilha AGO/AGOSTO.
+    - AGR -> coluna N (Nome do AVP) da planilha AGO/AGOSTO.
+    - O campo AGR existente na planilha mensal nunca e usado para montar o ranking.
+    - Se o protocolo nao for encontrado, o registro fica como AGR NAO ENCONTRADO
+      em vez de exibir parceiro, empresa ou nome truncado como se fosse AGR.
+    """
     if dados.empty:
         return dados
+
     mapa_avp = carregar_mapa_avp(pasta)
     dados = dados.copy()
+
     if "Protocolo" not in dados.columns:
         dados["Protocolo"] = dados.get("Pedido", "")
+
     dados["Protocolo Normalizado"] = dados["Protocolo"].map(normalizar_protocolo)
+    dados["AGR Original"] = dados.get("AGR", "")
+
+    # IMPORTANTE: zera o AGR da planilha mensal. A partir daqui, AGR so pode vir
+    # da coluna N (Nome do AVP) da planilha AGO/AGOSTO.
+    dados["AGR"] = ""
     dados["Nome do AVP"] = ""
     dados["Arquivo AVP"] = ""
-    dados["AGR Original"] = dados.get("AGR", "")
     dados["AVP Encontrado Por"] = ""
 
     if mapa_avp.empty:
+        dados["AGR"] = "AGR NAO ENCONTRADO"
         dados["AVP Encontrado"] = False
         return dados
 
-    # 1) Regra principal: protocolo + competência.
     dados = dados.merge(
         mapa_avp,
         how="left",
         on=["Ano Arquivo", "Mes Arquivo", "Protocolo Normalizado"],
         suffixes=("", "_MAPA_AVP"),
     )
+
     if "Nome do AVP_MAPA_AVP" in dados.columns:
         dados["Nome do AVP"] = dados["Nome do AVP_MAPA_AVP"].fillna("").astype(str).str.strip()
         dados = dados.drop(columns=["Nome do AVP_MAPA_AVP"])
@@ -348,32 +369,14 @@ def aplicar_avp_no_agr(dados: pd.DataFrame, pasta: Path) -> pd.DataFrame:
     else:
         dados["Arquivo AVP"] = dados["Arquivo AVP"].fillna("").astype(str).str.strip()
 
-    encontrou_protocolo = dados["Nome do AVP"].astype(str).str.strip() != ""
-    dados.loc[encontrou_protocolo, "AVP Encontrado Por"] = "Protocolo"
+    encontrou = dados["Nome do AVP"].ne("")
 
-    # 2) Fallback: quando o protocolo não existe na planilha AGO/AGOSTO,
-    # tenta recuperar o nome completo a partir do AGR truncado.
-    # A correção vale também para vendas de parceiro: o parceiro é a origem da venda,
-    # enquanto o AGR continua sendo a pessoa responsável pela emissão.
-    # Como o casamento só é aceito quando existe um único AVP possível, nomes de empresas
-    # (ex.: Vila21, Suport, Giga Comercial) permanecem inalterados.
-    nomes_por_mes = _mapa_nomes_avp_por_mes(mapa_avp)
-    pendentes = ~encontrou_protocolo
+    # O AGR exibido e exatamente o Nome do AVP (coluna N).
+    dados.loc[encontrou, "AGR"] = dados.loc[encontrou, "Nome do AVP"]
+    dados.loc[~encontrou, "AGR"] = "AGR NAO ENCONTRADO"
+    dados.loc[encontrou, "AVP Encontrado Por"] = "Coluna N / Protocolo"
+    dados["AVP Encontrado"] = encontrou
 
-    for idx in dados.index[pendentes]:
-        try:
-            chave = (int(dados.at[idx, "Ano Arquivo"]), int(dados.at[idx, "Mes Arquivo"]))
-        except (TypeError, ValueError):
-            continue
-        nome, arquivo = _encontrar_avp_por_nome(dados.at[idx, "AGR Original"], nomes_por_mes.get(chave, []))
-        if nome:
-            dados.at[idx, "Nome do AVP"] = nome
-            dados.at[idx, "Arquivo AVP"] = arquivo
-            dados.at[idx, "AVP Encontrado Por"] = "Nome AGR"
-
-    usar_avp = dados["Nome do AVP"].astype(str).str.strip() != ""
-    dados.loc[usar_avp, "AGR"] = dados.loc[usar_avp, "Nome do AVP"]
-    dados["AVP Encontrado"] = usar_avp
     return dados
 
 
@@ -1453,7 +1456,32 @@ def app_streamlit(pasta_padrao: Path):
 
     with tab_agr:
         st.markdown('<div class="section-title">Ranking dos AGR</div>', unsafe_allow_html=True)
-        ranking_agr = resumir(filtrado, "AGR")
+
+        # Ranking de AGR usa somente nomes vindos da coluna N (Nome do AVP).
+        agr_validos = filtrado[filtrado["AVP Encontrado"]].copy()
+        agr_nao_encontrados = filtrado[~filtrado["AVP Encontrado"]].copy()
+
+        if not agr_nao_encontrados.empty:
+            st.warning(
+                f"{len(agr_nao_encontrados)} registro(s) sem correspondencia de Protocolo na planilha AGO/AGOSTO. "
+                "Eles NAO entram no ranking de AGR, evitando que parceiros ou nomes da planilha mensal aparecam como AGR."
+            )
+            with st.expander("Ver protocolos sem AGR na coluna N", expanded=False):
+                cols_diag = [
+                    c for c in ["Data", "Pedido", "Protocolo", "Nome", "Parceiro", "AGR Original", "Arquivo"]
+                    if c in agr_nao_encontrados.columns
+                ]
+                mostrar_tabela(
+                    st,
+                    agr_nao_encontrados[cols_diag],
+                    use_container_width=True,
+                    hide_index=True,
+                    height=260,
+                )
+
+        ranking_agr = resumir(agr_validos, "AGR") if not agr_validos.empty else pd.DataFrame(
+            columns=["AGR", "Quantidade", "Faturamento", "Custo", "Margem_Bruta", "Margem_%"]
+        )
         mostrar_tabela(st, tabela_formatada(ranking_agr), use_container_width=True, hide_index=True, height=420)
         a1, a2 = st.columns(2)
         top_agr_fat = ranking_agr.head(20).sort_values("Faturamento")
