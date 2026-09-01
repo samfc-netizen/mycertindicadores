@@ -317,14 +317,15 @@ def _encontrar_avp_por_nome(agr_original: object, candidatos: list[tuple[str, st
 
 def aplicar_avp_no_agr(dados: pd.DataFrame, pasta: Path) -> pd.DataFrame:
     """
-    Define o AGR EXCLUSIVAMENTE pela coluna "Nome do AVP" da planilha AGO/AGOSTO.
+    Aplica a regra correta de AGR conforme a origem da venda.
 
     Regra de negocio:
-    - Protocolo da venda -> coluna A (Protocolo) da planilha AGO/AGOSTO.
-    - AGR -> coluna N (Nome do AVP) da planilha AGO/AGOSTO.
-    - O campo AGR existente na planilha mensal nunca e usado para montar o ranking.
-    - Se o protocolo nao for encontrado, o registro fica como AGR NAO ENCONTRADO
-      em vez de exibir parceiro, empresa ou nome truncado como se fosse AGR.
+    - Origem INTERNO: mantem o AGR original da planilha mensal (ex.: AGOSTO 2026).
+    - Origem PARCEIRO: ignora o AGR original e busca o AGR na planilha auxiliar
+      do mesmo mes/ano (ex.: AGO 2026), cruzando pelo Protocolo e trazendo
+      a coluna Nome do AVP (coluna N).
+    - Se uma venda de parceiro nao encontrar o protocolo/Nome do AVP, ela fica
+      como AGR NAO ENCONTRADO e nao deve entrar no ranking de AGR.
     """
     if dados.empty:
         return dados
@@ -335,47 +336,59 @@ def aplicar_avp_no_agr(dados: pd.DataFrame, pasta: Path) -> pd.DataFrame:
     if "Protocolo" not in dados.columns:
         dados["Protocolo"] = dados.get("Pedido", "")
 
-    dados["Protocolo Normalizado"] = dados["Protocolo"].map(normalizar_protocolo)
-    dados["AGR Original"] = dados.get("AGR", "")
+    if "Origem Normalizada" not in dados.columns:
+        dados["Origem Normalizada"] = dados.get("Origem", "").map(normalizar_texto)
 
-    # IMPORTANTE: zera o AGR da planilha mensal. A partir daqui, AGR so pode vir
-    # da coluna N (Nome do AVP) da planilha AGO/AGOSTO.
-    dados["AGR"] = ""
+    dados["Protocolo Normalizado"] = dados["Protocolo"].map(normalizar_protocolo)
+    dados["AGR Original"] = dados.get("AGR", "").fillna("").astype(str).str.strip()
     dados["Nome do AVP"] = ""
     dados["Arquivo AVP"] = ""
     dados["AVP Encontrado Por"] = ""
 
-    if mapa_avp.empty:
-        dados["AGR"] = "AGR NAO ENCONTRADO"
-        dados["AVP Encontrado"] = False
-        return dados
+    # Faz o merge com a planilha AGO/AGOSTO para termos a coluna N disponivel
+    # nas vendas de parceiro. O merge nao altera o AGR dos registros internos.
+    if not mapa_avp.empty:
+        dados = dados.merge(
+            mapa_avp,
+            how="left",
+            on=["Ano Arquivo", "Mes Arquivo", "Protocolo Normalizado"],
+            suffixes=("", "_MAPA_AVP"),
+        )
 
-    dados = dados.merge(
-        mapa_avp,
-        how="left",
-        on=["Ano Arquivo", "Mes Arquivo", "Protocolo Normalizado"],
-        suffixes=("", "_MAPA_AVP"),
-    )
+        if "Nome do AVP_MAPA_AVP" in dados.columns:
+            dados["Nome do AVP"] = dados["Nome do AVP_MAPA_AVP"].fillna("").astype(str).str.strip()
+            dados = dados.drop(columns=["Nome do AVP_MAPA_AVP"])
+        else:
+            dados["Nome do AVP"] = dados["Nome do AVP"].fillna("").astype(str).str.strip()
 
-    if "Nome do AVP_MAPA_AVP" in dados.columns:
-        dados["Nome do AVP"] = dados["Nome do AVP_MAPA_AVP"].fillna("").astype(str).str.strip()
-        dados = dados.drop(columns=["Nome do AVP_MAPA_AVP"])
-    else:
-        dados["Nome do AVP"] = dados["Nome do AVP"].fillna("").astype(str).str.strip()
+        if "Arquivo AVP_MAPA_AVP" in dados.columns:
+            dados["Arquivo AVP"] = dados["Arquivo AVP_MAPA_AVP"].fillna("").astype(str).str.strip()
+            dados = dados.drop(columns=["Arquivo AVP_MAPA_AVP"])
+        else:
+            dados["Arquivo AVP"] = dados["Arquivo AVP"].fillna("").astype(str).str.strip()
 
-    if "Arquivo AVP_MAPA_AVP" in dados.columns:
-        dados["Arquivo AVP"] = dados["Arquivo AVP_MAPA_AVP"].fillna("").astype(str).str.strip()
-        dados = dados.drop(columns=["Arquivo AVP_MAPA_AVP"])
-    else:
-        dados["Arquivo AVP"] = dados["Arquivo AVP"].fillna("").astype(str).str.strip()
+    eh_parceiro = dados["Origem Normalizada"].eq("PARCEIRO")
+    eh_interno = ~eh_parceiro
+    encontrou_avp = dados["Nome do AVP"].fillna("").astype(str).str.strip().ne("")
 
-    encontrou = dados["Nome do AVP"].ne("")
+    # INTERNO -> AGR original da planilha mensal.
+    dados.loc[eh_interno, "AGR"] = dados.loc[eh_interno, "AGR Original"]
+    dados.loc[eh_interno & dados["AGR Original"].ne(""), "AVP Encontrado Por"] = "AGR original / Interno"
 
-    # O AGR exibido e exatamente o Nome do AVP (coluna N).
-    dados.loc[encontrou, "AGR"] = dados.loc[encontrou, "Nome do AVP"]
-    dados.loc[~encontrou, "AGR"] = "AGR NAO ENCONTRADO"
-    dados.loc[encontrou, "AVP Encontrado Por"] = "Coluna N / Protocolo"
-    dados["AVP Encontrado"] = encontrou
+    # PARCEIRO -> AGR obrigatoriamente vindo da coluna N (Nome do AVP).
+    parceiro_com_avp = eh_parceiro & encontrou_avp
+    parceiro_sem_avp = eh_parceiro & ~encontrou_avp
+    dados.loc[parceiro_com_avp, "AGR"] = dados.loc[parceiro_com_avp, "Nome do AVP"]
+    dados.loc[parceiro_com_avp, "AVP Encontrado Por"] = "Coluna N / Protocolo / Parceiro"
+    dados.loc[parceiro_sem_avp, "AGR"] = "AGR NAO ENCONTRADO"
+
+    # AVP Encontrado indica especificamente se houve correspondencia na planilha AGO.
+    dados["AVP Encontrado"] = parceiro_com_avp
+
+    # AGR Valido controla o ranking:
+    # - Interno: AGR original preenchido.
+    # - Parceiro: Nome do AVP encontrado na coluna N.
+    dados["AGR Valido"] = (eh_interno & dados["AGR Original"].ne("")) | parceiro_com_avp
 
     return dados
 
@@ -1457,23 +1470,31 @@ def app_streamlit(pasta_padrao: Path):
     with tab_agr:
         st.markdown('<div class="section-title">Ranking dos AGR</div>', unsafe_allow_html=True)
 
-        # Ranking de AGR usa somente nomes vindos da coluna N (Nome do AVP).
-        agr_validos = filtrado[filtrado["AVP Encontrado"]].copy()
-        agr_nao_encontrados = filtrado[~filtrado["AVP Encontrado"]].copy()
+        # Regra do ranking:
+        # INTERNO usa o AGR original; PARCEIRO usa exclusivamente a coluna N (Nome do AVP).
+        if "AGR Valido" in filtrado.columns:
+            agr_validos = filtrado[filtrado["AGR Valido"]].copy()
+        else:
+            agr_validos = filtrado[filtrado["AGR"].fillna("").astype(str).str.strip().ne("")].copy()
 
-        if not agr_nao_encontrados.empty:
+        parceiro_sem_agr = filtrado[
+            filtrado["Origem Normalizada"].eq("PARCEIRO")
+            & ~filtrado.get("AGR Valido", pd.Series(False, index=filtrado.index))
+        ].copy()
+
+        if not parceiro_sem_agr.empty:
             st.warning(
-                f"{len(agr_nao_encontrados)} registro(s) sem correspondencia de Protocolo na planilha AGO/AGOSTO. "
-                "Eles NAO entram no ranking de AGR, evitando que parceiros ou nomes da planilha mensal aparecam como AGR."
+                f"{len(parceiro_sem_agr)} venda(s) de parceiro sem correspondencia de Protocolo/Nome do AVP na planilha AGO/AGOSTO. "
+                "Esses registros NAO entram no ranking de AGR."
             )
-            with st.expander("Ver protocolos sem AGR na coluna N", expanded=False):
+            with st.expander("Ver vendas de parceiro sem AGR na coluna N", expanded=False):
                 cols_diag = [
                     c for c in ["Data", "Pedido", "Protocolo", "Nome", "Parceiro", "AGR Original", "Arquivo"]
-                    if c in agr_nao_encontrados.columns
+                    if c in parceiro_sem_agr.columns
                 ]
                 mostrar_tabela(
                     st,
-                    agr_nao_encontrados[cols_diag],
+                    parceiro_sem_agr[cols_diag],
                     use_container_width=True,
                     hide_index=True,
                     height=260,
