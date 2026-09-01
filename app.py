@@ -353,10 +353,12 @@ def aplicar_avp_no_agr(dados: pd.DataFrame, pasta: Path) -> pd.DataFrame:
 
     # 2) Fallback: quando o protocolo não existe na planilha AGO/AGOSTO,
     # tenta recuperar o nome completo a partir do AGR truncado.
-    # Não aplica em vendas de parceiro para evitar associação indevida.
+    # A correção vale também para vendas de parceiro: o parceiro é a origem da venda,
+    # enquanto o AGR continua sendo a pessoa responsável pela emissão.
+    # Como o casamento só é aceito quando existe um único AVP possível, nomes de empresas
+    # (ex.: Vila21, Suport, Giga Comercial) permanecem inalterados.
     nomes_por_mes = _mapa_nomes_avp_por_mes(mapa_avp)
-    origem_norm = dados.get("Origem Normalizada", pd.Series("", index=dados.index)).fillna("").astype(str)
-    pendentes = (~encontrou_protocolo) & (~origem_norm.eq("PARCEIRO"))
+    pendentes = ~encontrou_protocolo
 
     for idx in dados.index[pendentes]:
         try:
