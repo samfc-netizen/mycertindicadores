@@ -267,6 +267,51 @@ def carregar_mapa_avp(pasta: Path) -> pd.DataFrame:
     return mapa[["Ano Arquivo", "Mes Arquivo", "Protocolo Normalizado", "Nome do AVP", "Arquivo AVP"]]
 
 
+def normalizar_nome_avp(valor: object) -> str:
+    """Normaliza nomes para casar AGR truncado/corrompido com o nome completo do AVP."""
+    texto = normalizar_texto(valor)
+    texto = texto.replace("�", "")
+    texto = re.sub(r"[^A-Z0-9 ]", "", texto)
+    texto = re.sub(r"\s+", " ", texto).strip()
+    return texto
+
+
+def _mapa_nomes_avp_por_mes(mapa_avp: pd.DataFrame) -> dict[tuple[int, int], list[tuple[str, str, str]]]:
+    """Lista nomes únicos de AVP por competência para o fallback por nome."""
+    resultado: dict[tuple[int, int], list[tuple[str, str, str]]] = {}
+    if mapa_avp.empty:
+        return resultado
+
+    base = mapa_avp[["Ano Arquivo", "Mes Arquivo", "Nome do AVP", "Arquivo AVP"]].drop_duplicates().copy()
+    base["Nome Normalizado"] = base["Nome do AVP"].map(normalizar_nome_avp)
+    base = base[base["Nome Normalizado"].str.len() >= 5]
+
+    for (ano, mes), grupo in base.groupby(["Ano Arquivo", "Mes Arquivo"]):
+        resultado[(int(ano), int(mes))] = [
+            (row["Nome Normalizado"], str(row["Nome do AVP"]).strip(), str(row["Arquivo AVP"]).strip())
+            for _, row in grupo.iterrows()
+        ]
+    return resultado
+
+
+def _encontrar_avp_por_nome(agr_original: object, candidatos: list[tuple[str, str, str]]) -> tuple[str, str]:
+    """Retorna o AVP quando o AGR é prefixo inequívoco do nome completo (ou vice-versa)."""
+    agr_norm = normalizar_nome_avp(agr_original)
+    if len(agr_norm) < 5:
+        return "", ""
+
+    matches = []
+    for nome_norm, nome_completo, arquivo in candidatos:
+        if agr_norm == nome_norm or nome_norm.startswith(agr_norm) or agr_norm.startswith(nome_norm):
+            matches.append((nome_completo, arquivo))
+
+    # Só corrige automaticamente se houver uma única pessoa possível.
+    unicos = {(nome, arquivo) for nome, arquivo in matches}
+    if len(unicos) == 1:
+        return next(iter(unicos))
+    return "", ""
+
+
 def aplicar_avp_no_agr(dados: pd.DataFrame, pasta: Path) -> pd.DataFrame:
     if dados.empty:
         return dados
@@ -278,10 +323,13 @@ def aplicar_avp_no_agr(dados: pd.DataFrame, pasta: Path) -> pd.DataFrame:
     dados["Nome do AVP"] = ""
     dados["Arquivo AVP"] = ""
     dados["AGR Original"] = dados.get("AGR", "")
+    dados["AVP Encontrado Por"] = ""
 
     if mapa_avp.empty:
+        dados["AVP Encontrado"] = False
         return dados
 
+    # 1) Regra principal: protocolo + competência.
     dados = dados.merge(
         mapa_avp,
         how="left",
@@ -299,6 +347,27 @@ def aplicar_avp_no_agr(dados: pd.DataFrame, pasta: Path) -> pd.DataFrame:
         dados = dados.drop(columns=["Arquivo AVP_MAPA_AVP"])
     else:
         dados["Arquivo AVP"] = dados["Arquivo AVP"].fillna("").astype(str).str.strip()
+
+    encontrou_protocolo = dados["Nome do AVP"].astype(str).str.strip() != ""
+    dados.loc[encontrou_protocolo, "AVP Encontrado Por"] = "Protocolo"
+
+    # 2) Fallback: quando o protocolo não existe na planilha AGO/AGOSTO,
+    # tenta recuperar o nome completo a partir do AGR truncado.
+    # Não aplica em vendas de parceiro para evitar associação indevida.
+    nomes_por_mes = _mapa_nomes_avp_por_mes(mapa_avp)
+    origem_norm = dados.get("Origem Normalizada", pd.Series("", index=dados.index)).fillna("").astype(str)
+    pendentes = (~encontrou_protocolo) & (~origem_norm.eq("PARCEIRO"))
+
+    for idx in dados.index[pendentes]:
+        try:
+            chave = (int(dados.at[idx, "Ano Arquivo"]), int(dados.at[idx, "Mes Arquivo"]))
+        except (TypeError, ValueError):
+            continue
+        nome, arquivo = _encontrar_avp_por_nome(dados.at[idx, "AGR Original"], nomes_por_mes.get(chave, []))
+        if nome:
+            dados.at[idx, "Nome do AVP"] = nome
+            dados.at[idx, "Arquivo AVP"] = arquivo
+            dados.at[idx, "AVP Encontrado Por"] = "Nome AGR"
 
     usar_avp = dados["Nome do AVP"].astype(str).str.strip() != ""
     dados.loc[usar_avp, "AGR"] = dados.loc[usar_avp, "Nome do AVP"]
